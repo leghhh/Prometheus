@@ -1,9 +1,3 @@
--- This Script is Part of the Prometheus Obfuscator by levno-710
---
--- visitast.lua
---
--- This Script provides a utility function for visiting each node of an AST.
-
 local Ast = require("prometheus.ast");
 local util = require("prometheus.util");
 
@@ -31,7 +25,6 @@ function visitAst(ast, previsit, postvisit, data)
 		end
 	end
 
-	-- Is Function Block because global scope is treated like a Function
 	visitBlock(ast.body, previsit, postvisit, data, true);
 
 	if(type(postvisit) == "function") then
@@ -96,7 +89,6 @@ function visitStatement(statement, previsit, postvisit, data)
 		end
 	end
 
-	-- Visit Child Nodes of Statement
 	if(statement.kind == AstKind.ReturnStatement) then
 		for i, expression in ipairs(statement.args) do
 			statement.args[i] = visitExpression(expression, previsit, postvisit, data);

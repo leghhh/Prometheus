@@ -1,17 +1,3 @@
--- This Script is Part of the Prometheus Obfuscator by levno-710
---
--- parser.lua
--- Overview:
--- This Script provides a class for parsing of lua code.
--- This Parser is Capable of parsing LuaU and Lua5.1
---
--- Note that when parsing LuaU "continue" is treated as a Keyword, so no variable may be named "continue" even though this would be valid in LuaU
---
--- Settings Object:
--- luaVersion : The LuaVersion of the Script - Currently Supported : Lua51 and LuaU
--- AllowInternalIdentifiers : Skip reserved-prefix warnings for generated code (default false)
---
-
 local Tokenizer = require("prometheus.tokenizer");
 local Enums = require("prometheus.enums");
 local util = require("prometheus.util");
@@ -78,7 +64,6 @@ function Parser:new(settings)
 	return parser;
 end
 
--- Function to peek the n'th token
 local function peek(self, n)
 	n = n or 0;
 	local i = self.index + n + 1;
@@ -88,7 +73,6 @@ local function peek(self, n)
 	return self.tokens[i];
 end
 
--- Function to get the next Token
 local function get(self)
 	local i = self.index + 1;
 	if i > self.length then
@@ -142,21 +126,19 @@ local function expect(self, kind, source)
 	end
 end
 
--- Parse the given code to an Abstract Syntax Tree
 function Parser:parse(code)
 	self.tokenizer:append(code);
 	self.tokens = self.tokenizer:scanAll();
 	self.length = #self.tokens;
 
-	-- Create Global Variable Scope
 	local globalScope = Scope:newGlobal();
 
 	local ast = Ast.TopNode(self:block(globalScope, false), globalScope);
-	-- File Must be Over when Top Node is Fully Parsed
+
 	expect(self, TokenKind.Eof);
 
 	logger:debug("Cleaning up Parser for next Use ...")
-	-- Clean Up
+
 	self.tokenizer:reset();
 	self.tokens = {};
 	self.index = 0;
@@ -167,7 +149,6 @@ function Parser:parse(code)
 	return ast;
 end
 
--- Parse a Code Block
 function Parser:block(parentScope, currentLoop, scope)
 	scope = scope or Scope:new(parentScope);
 	local statements = {};
@@ -177,47 +158,41 @@ function Parser:block(parentScope, currentLoop, scope)
 		table.insert(statements, statement);
 	until isTerminatingStatement or not statement
 
-	-- Consume Eventual Semicolon after terminating return, break or continue
 	consume(self, TokenKind.Symbol, ";");
 
 	return Ast.Block(statements, scope);
 end
 
 function Parser:statement(scope, currentLoop)
-	-- Skip all semicolons before next real statement
-	-- NOP statements are therefore ignored
+
 	while(consume(self, TokenKind.Symbol, ";")) do
 
 	end
 
-	-- Break Statement - only valid inside of Loops
 	if(consume(self, TokenKind.Keyword, "break")) then
 		if(not currentLoop) then
 			if self.disableLog then error() end;
 			logger:error(generateError(self, "the break Statement is only valid inside of loops"));
 		end
-		-- Return true as Second value because break must be the last Statement in a block
+
 		return Ast.BreakStatement(currentLoop, scope), true;
 	end
 
-	-- Continue Statement - only valid inside of Loops - only valid in LuaU
 	if(self.luaVersion == LuaVersion.LuaU and consume(self, TokenKind.Keyword, "continue")) then
 		if(not currentLoop) then
 			if self.disableLog then error() end;
 			logger:error(generateError(self, "the continue Statement is only valid inside of loops"));
 		end
-		-- Return true as Second value because continue must be the last Statement in a block
+
 		return Ast.ContinueStatement(currentLoop, scope), true;
 	end
 
-	-- do ... end Statement
 	if(consume(self, TokenKind.Keyword, "do")) then
 		local body = self:block(scope, currentLoop);
 		expect(self, TokenKind.Keyword, "end");
 		return Ast.DoStatement(body);
 	end
 
-	-- While Statement
 	if(consume(self, TokenKind.Keyword, "while")) then
 		local condition = self:expression(scope);
 		expect(self, TokenKind.Keyword, "do");
@@ -227,7 +202,6 @@ function Parser:statement(scope, currentLoop)
 		return stat;
 	end
 
-	-- Repeat Statement
 	if(consume(self, TokenKind.Keyword, "repeat")) then
 		local repeatScope = Scope:new(scope);
 		local stat = Ast.RepeatStatement(nil, nil, scope);
@@ -237,24 +211,22 @@ function Parser:statement(scope, currentLoop)
 		return stat;
 	end
 
-	-- Return Statement
 	if(consume(self, TokenKind.Keyword, "return")) then
 		local args = {};
 		if(not is(self, TokenKind.Keyword, "end") and not is(self, TokenKind.Keyword, "elseif") and not is(self, TokenKind.Keyword, "else") and not is(self, TokenKind.Symbol, ";") and not is(self, TokenKind.Eof)) then
 			args = self:exprList(scope);
 		end
-		-- Return true as Second value because return must be the last Statement in a block
+
 		return Ast.ReturnStatement(args), true;
 	end
 
-	-- If Statement
 	if(consume(self, TokenKind.Keyword, "if")) then
 		local condition = self:expression(scope);
 		expect(self, TokenKind.Keyword, "then");
 		local body = self:block(scope, currentLoop);
 
 		local elseifs = {};
-		-- Elseifs
+
 		while(consume(self, TokenKind.Keyword, "elseif")) do
 			local condition = self:expression(scope);
 			expect(self, TokenKind.Keyword, "then");
@@ -267,7 +239,7 @@ function Parser:statement(scope, currentLoop)
 		end
 
 		local elsebody = nil;
-		-- Else
+
 		if(consume(self, TokenKind.Keyword, "else")) then
 			elsebody = self:block(scope, currentLoop);
 		end
@@ -277,9 +249,8 @@ function Parser:statement(scope, currentLoop)
 		return Ast.IfStatement(condition, body, elseifs, elsebody);
 	end
 
-	-- Function Declaration
 	if(consume(self, TokenKind.Keyword, "function")) then
-		-- TODO: Parse Function Declaration Name
+
 		local obj = self:funcName(scope);
 		local baseScope = obj.scope;
 		local baseId = obj.id;
@@ -302,9 +273,8 @@ function Parser:statement(scope, currentLoop)
 		return Ast.FunctionDeclaration(baseScope, baseId, indices, args, body);
 	end
 
-	-- Local Function or Variable Declaration
 	if(consume(self, TokenKind.Keyword, "local")) then
-		-- Local Function Declaration
+
 		if(consume(self, TokenKind.Keyword, "function")) then
 			local ident = expect(self, TokenKind.Ident);
 			local name = ident.value;
@@ -322,14 +292,12 @@ function Parser:statement(scope, currentLoop)
 			return Ast.LocalFunctionDeclaration(scope, id, args, body);
 		end
 
-		-- Local Variable Declaration
 		local ids = self:nameList(scope);
 		local expressions = {};
 		if(consume(self, TokenKind.Symbol, "=")) then
 			expressions = self:exprList(scope);
 		end
 
-		-- Variables can only be reffered to in the next statement, so the id's are enabled after the expressions have been parsed
 		self:enableNameList(scope, ids);
 
 		if(#expressions > #ids) then
@@ -341,9 +309,8 @@ function Parser:statement(scope, currentLoop)
 		return Ast.LocalVariableDeclaration(scope, ids, expressions);
 	end
 
-	-- For Statement
 	if(consume(self, TokenKind.Keyword, "for")) then
-		-- Normal for Statement
+
 		if(is(self, TokenKind.Symbol, "=", 1)) then
 			local forScope = Scope:new(scope);
 
@@ -368,17 +335,12 @@ function Parser:statement(scope, currentLoop)
 			return stat;
 		end
 
-		-- For ... in ... statement
 		local forScope = Scope:new(scope);
 
 		local ids = self:nameList(forScope);
 		expect(self, TokenKind.Keyword, "in");
 		local expressions = self:exprList(scope);
-		-- Enable Ids after Expression Parsing so that code like this works:
-		--	local z = {10,20}
-		--	for y,z in ipairs(z) do
-		--		print(y, z);
-		-- 	end
+
 		self:enableNameList(forScope, ids);
 		expect(self, TokenKind.Keyword, "do");
 		local stat = Ast.ForInStatement(forScope, ids, expressions, nil, scope);
@@ -389,19 +351,17 @@ function Parser:statement(scope, currentLoop)
 	end
 
 	local expr = self:primaryExpression(scope);
-	-- Variable Assignment or Function Call
+
 	if expr then
-		-- Function Call Statement
+
 		if(expr.kind == AstKind.FunctionCallExpression) then
 			return Ast.FunctionCallStatement(expr.base, expr.args);
 		end
 
-		-- Function Call Statement passing self
 		if(expr.kind == AstKind.PassSelfFunctionCallExpression) then
 			return Ast.PassSelfFunctionCallStatement(expr.base, expr.passSelfFunctionName, expr.args);
 		end
 
-		-- Variable Assignment
 		if(expr.kind == AstKind.IndexExpression or expr.kind == AstKind.VariableExpression) then
 			if(expr.kind == AstKind.IndexExpression) then
 				expr.kind = AstKind.AssignmentIndexing
@@ -411,7 +371,7 @@ function Parser:statement(scope, currentLoop)
 			end
 
 			if(self.luaVersion == LuaVersion.LuaU) then
-				-- LuaU Compound Assignment
+
 				if(consume(self, TokenKind.Symbol, "+=")) then
 					local rhs = self:expression(scope);
 					return Ast.CompoundAddStatement(expr, rhs);
@@ -502,7 +462,6 @@ function Parser:primaryExpression(scope)
 	end
 end
 
--- List of expressions Seperated by a comma
 function Parser:exprList(scope)
 	local expressions = {
 		self:expression(scope)
@@ -513,7 +472,6 @@ function Parser:exprList(scope)
 	return expressions;
 end
 
--- list of local variable names
 function Parser:nameList(scope)
 	local ids = {};
 
@@ -536,8 +494,6 @@ function Parser:enableNameList(scope, list)
 	end
 end
 
-
--- function name
 function Parser:funcName(scope)
 	local ident = expect(self, TokenKind.Ident);
 	local baseName = ident.value;
@@ -564,7 +520,6 @@ function Parser:funcName(scope)
 	};
 end
 
--- Expression
 function Parser:expression(scope)
 	return self:expressionOr(scope);
 end
@@ -664,7 +619,6 @@ function Parser:expressionAddSub(scope)
 		end
 	until not found;
 
-
 	return curr;
 end
 
@@ -718,7 +672,7 @@ function Parser:expressionPow(scope)
 	local lhs = self:tableOrFunctionLiteral(scope);
 
 	if(consume(self, TokenKind.Symbol, "^")) then
-		-- Allow unary operators on the rhs (e.g. 2 ^ #x, 2 ^ -x) while preserving right-associativity. ~ SpinnySpiwal
+
 		local rhs = self:expressionUnary(scope);
 		return Ast.PowExpression(lhs, rhs, true);
 	end
@@ -726,7 +680,6 @@ function Parser:expressionPow(scope)
 	return lhs;
 end
 
--- Table Literals and Function Literals cannot directly be called or indexed
 function Parser:tableOrFunctionLiteral(scope)
 
 	if(is(self, TokenKind.Symbol, "{")) then
@@ -793,7 +746,6 @@ function Parser:expressionFunctionCall(scope, base)
 		return base;
 	end
 
-	-- Normal Function Call
 	local args = {};
 	if(is(self, TokenKind.String)) then
 		args = {
@@ -814,12 +766,10 @@ function Parser:expressionFunctionCall(scope, base)
 
 	local node = Ast.FunctionCallExpression(base, args);
 
-	-- the result of a function call can be indexed
 	if(is(self, TokenKind.Symbol, ".") or is(self, TokenKind.Symbol, "[") or is(self, TokenKind.Symbol, ":")) then
 		return self:expressionIndex(scope, node);
 	end
 
-	-- The result of a function call can be a function that is again called
 	if(is(self, TokenKind.Symbol, "(") or is(self, TokenKind.Symbol, "{") or is(self, TokenKind.String)) then
 		return self:expressionFunctionCall(scope, node);
 	end
@@ -830,14 +780,12 @@ end
 function Parser:expressionIndex(scope, base)
 	base = base or self:expressionLiteral(scope);
 
-	-- Parse Indexing Expressions
 	while(consume(self, TokenKind.Symbol, "[")) do
 		local expr = self:expression(scope);
 		expect(self, TokenKind.Symbol, "]");
 		base = Ast.IndexExpression(base, expr);
 	end
 
-	-- Parse Indexing Expressions
 	while consume(self, TokenKind.Symbol, ".") do
 		local ident = expect(self, TokenKind.Ident);
 		base = Ast.IndexExpression(base, Ast.StringExpression(ident.value));
@@ -849,7 +797,6 @@ function Parser:expressionIndex(scope, base)
 		end
 	end
 
-	-- Function Passing self
 	if(consume(self, TokenKind.Symbol, ":")) then
 		local passSelfFunctionName = expect(self, TokenKind.Ident).value;
 		local args = {};
@@ -871,12 +818,10 @@ function Parser:expressionIndex(scope, base)
 
 		local node = Ast.PassSelfFunctionCallExpression(base, passSelfFunctionName, args);
 
-		-- the result of a function call can be indexed
 		if(is(self, TokenKind.Symbol, ".") or is(self, TokenKind.Symbol, "[") or is(self, TokenKind.Symbol, ":")) then
 			return self:expressionIndex(scope, node);
 		end
 
-		-- The result of a function call can be a function that is again called
 		if(is(self, TokenKind.Symbol, "(") or is(self, TokenKind.Symbol, "{") or is(self, TokenKind.String)) then
 			return self:expressionFunctionCall(scope, node);
 		end
@@ -884,7 +829,6 @@ function Parser:expressionIndex(scope, base)
 		return node
 	end
 
-	-- The result of a function call can be a function that is again called
 	if(is(self, TokenKind.Symbol, "(") or is(self, TokenKind.Symbol, "{") or is(self, TokenKind.String)) then
 		return self:expressionFunctionCall(scope, base);
 	end
@@ -893,7 +837,7 @@ function Parser:expressionIndex(scope, base)
 end
 
 function Parser:expressionLiteral(scope)
-	-- () expression
+
 	if(consume(self, TokenKind.Symbol, "(")) then
 		local expr = self:expression(scope);
 		expect(self, TokenKind.Symbol, ")");
@@ -903,37 +847,30 @@ function Parser:expressionLiteral(scope)
 		return expr;
 	end
 
-	-- String Literal
 	if(is(self, TokenKind.String)) then
 		return Ast.StringExpression(get(self).value);
 	end
 
-	-- Number Literal
 	if(is(self, TokenKind.Number)) then
 		return Ast.NumberExpression(get(self).value);
 	end
 
-	-- True Literal
 	if(consume(self, TokenKind.Keyword, "true")) then
 		return Ast.BooleanExpression(true);
 	end
 
-	-- False Literal
 	if(consume(self, TokenKind.Keyword, "false")) then
 		return Ast.BooleanExpression(false);
 	end
 
-	-- Nil Literal
 	if(consume(self, TokenKind.Keyword, "nil")) then
 		return Ast.NilExpression();
 	end
 
-	-- Vararg Literal
 	if(consume(self, TokenKind.Symbol, "...")) then
 		return Ast.VarargExpression();
 	end
 
-	-- Variable
 	if(is(self, TokenKind.Ident)) then
 		local ident = get(self);
 		local name = ident.value;
@@ -942,7 +879,6 @@ function Parser:expressionLiteral(scope)
 		return Ast.VariableExpression(scope, id);
 	end
 
-	-- IfElse
 	if(LuaVersion.LuaU) then
 		if(consume(self, TokenKind.Keyword, "if")) then
 			local condition = self:expression(scope);
@@ -973,7 +909,7 @@ function Parser:expressionLiteral(scope)
 end
 
 function Parser:tableConstructor(scope)
-	-- TODO: Parse Table Literals
+
 	local entries = {};
 
 	expect(self, TokenKind.Symbol, "{");
@@ -994,7 +930,6 @@ function Parser:tableConstructor(scope)
 			local value = self:expression(scope);
 			table.insert(entries, Ast.TableEntry(value));
 		end
-
 
 		if (not consume(self, TokenKind.Symbol, ";") and not consume(self, TokenKind.Symbol, ",") and not is(self, TokenKind.Symbol, "}")) then
 			if self.disableLog then error() end

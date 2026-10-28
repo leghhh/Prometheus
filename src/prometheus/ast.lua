@@ -1,17 +1,10 @@
--- This Script is Part of the Prometheus Obfuscator by levno-710
---
--- ast.lua
---
--- This Script provides the Abstract Syntax Tree (AST) for Prometheus.
-
 local Ast = {}
 
 local AstKind = {
-	-- Misc
+
 	TopNode = "TopNode";
 	Block = "Block";
 
-	-- Statements
 	ContinueStatement = "ContinueStatement";
 	BreakStatement = "BreakStatement";
 	DoStatement = "DoStatement";
@@ -28,7 +21,6 @@ local AstKind = {
 	PassSelfFunctionCallStatement = "PassSelfFunctionCallStatement";
 	AssignmentStatement = "AssignmentStatement";
 
-	-- LuaU Compound Statements
 	CompoundAddStatement = "CompoundAddStatement";
 	CompoundSubStatement = "CompoundSubStatement";
 	CompoundMulStatement = "CompoundMulStatement";
@@ -37,11 +29,9 @@ local AstKind = {
 	CompoundPowStatement = "CompoundPowStatement";
 	CompoundConcatStatement = "CompoundConcatStatement";
 
-	-- Assignment Index
 	AssignmentIndexing = "AssignmentIndexing";
 	AssignmentVariable = "AssignmentVariable";
 
-	-- Expression Nodes
 	BooleanExpression = "BooleanExpression";
 	NumberExpression = "NumberExpression";
 	StringExpression = "StringExpression";
@@ -72,11 +62,9 @@ local AstKind = {
 	FunctionLiteralExpression = "FunctionLiteralExpression";
 	TableConstructorExpression = "TableConstructorExpression";
 
-	-- Table Entry
 	TableEntry = "TableEntry";
 	KeyedTableEntry = "KeyedTableEntry";
 
-	-- Misc
 	NopStatement = "NopStatement";
 
 	IfElseExpression = "IfElseExpression";
@@ -140,8 +128,6 @@ function Ast.ConstantNode(val)
 	end
 end
 
-
-
 function Ast.NopStatement()
 	return {
 		kind = AstKind.NopStatement;
@@ -158,7 +144,6 @@ function Ast.IfElseExpression(condition, true_value, elseifs, false_value)
 	}
 end
 
--- Create Ast Top Node
 function Ast.TopNode(body, globalScope)
 	return {
 		kind = AstKind.TopNode,
@@ -192,7 +177,6 @@ function Ast.TableConstructorExpression(entries)
 	};
 end
 
--- Create Statement Block
 function Ast.Block(statements, scope)
 	return {
 		kind = AstKind.Block,
@@ -201,7 +185,6 @@ function Ast.Block(statements, scope)
 	}
 end
 
--- Create Break Statement
 function Ast.BreakStatement(loop, scope)
 	return {
 		kind = AstKind.BreakStatement,
@@ -210,7 +193,6 @@ function Ast.BreakStatement(loop, scope)
 	}
 end
 
--- Create Continue Statement
 function Ast.ContinueStatement(loop, scope)
 	return {
 		kind = AstKind.ContinueStatement,
@@ -800,7 +782,5 @@ function Ast.FunctionLiteralExpression(args, body)
 		body = body,
 	}
 end
-
-
 
 return Ast;

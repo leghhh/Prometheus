@@ -1,13 +1,7 @@
--- This Script is Part of the Prometheus Obfuscator by levno-710
---
--- tokenizer.lua
--- Overview:
--- This Script provides a class for lexical Analysis of lua code.
--- This Tokenizer is Capable of tokenizing LuaU and Lua5.1
 local Enums = require("prometheus.enums");
 local util = require("prometheus.util");
 local logger = require("logger");
-local config = require("config");
+local IDENT_PREFIX = "__prometheus_";
 
 local LuaVersion = Enums.LuaVersion;
 local lookupify = util.lookupify;
@@ -70,28 +64,25 @@ local function generateWarning(token, message)
 end
 
 function Tokenizer:getPosition(i)
-	local column = self.columnMap[i]
-
-	if not column then --// `i` is bigger than self.length, this shouldn't happen, but it did. (Theres probably some error in the tokenizer, cant find it.)
-		column = self.columnMap[#self.columnMap]
+	local column = self.columnMap[i] or self.columnMap[#self.columnMap]
+	if not column then
+		return 1, 1
 	end
-
-	return column.id, column.charMap[i]
+	return column.id, column.charMap[i] or 1
 end
 
---// Prepare columnMap for getPosition
 function Tokenizer:prepareGetPosition()
 	local columnMap, column = {}, { charMap = {}, id = 1, length = 0 }
 
 	for index = 1, self.length do
-		local character = string.sub(self.source, index, index) -- NOTE_1: this could use table.clone to reduce amount of NEWTABLE (if that causes any performance issues)
+		local character = string.sub(self.source, index, index)
 
 		local columnLength = column.length + 1
 		column.length = columnLength
 		column.charMap[index] = columnLength
 
 		if character == "\n" then
-			column = { charMap = {}, id = column.id + 1, length = 0 } -- NOTE_1
+			column = { charMap = {}, id = column.id + 1, length = 0 }
 		end
 
 		columnMap[index] = column
@@ -100,7 +91,6 @@ function Tokenizer:prepareGetPosition()
 	self.columnMap = columnMap
 end
 
--- Constructor for Tokenizer
 function Tokenizer:new(settings)
 	local luaVersion = (settings and (settings.luaVersion or settings.LuaVersion)) or LuaVersion.LuaU;
 	local conventions = Tokenizer.Conventions[luaVersion];
@@ -110,10 +100,10 @@ function Tokenizer:new(settings)
 	end
 
 	local tokenizer = {
-		index = 0, -- Index where the current char is read
+		index = 0,
 		length = 0,
-		source = "", -- Source to Tokenize
-		luaVersion = luaVersion, -- LuaVersion to be used while Tokenizing
+		source = "",
+		luaVersion = luaVersion,
 		allowInternalIdentifiers = settings and settings.AllowInternalIdentifiers == true,
 		conventions = conventions;
 
@@ -154,7 +144,6 @@ function Tokenizer:new(settings)
 	return tokenizer;
 end
 
--- Reset State of Tokenizer to Tokenize another File
 function Tokenizer:reset()
 	self.index = 0;
 	self.length = 0;
@@ -163,14 +152,12 @@ function Tokenizer:reset()
 	self.columnMap = {};
 end
 
--- Append String to this Tokenizer
 function Tokenizer:append(code)
 	self.source = self.source .. code
 	self.length = self.length + code:len();
 	self:prepareGetPosition();
 end
 
--- Function to peek the n'th char in the source of the tokenizer
 local function peek(self, n)
 	n = n or 0;
 	local i = self.index + n + 1;
@@ -180,7 +167,6 @@ local function peek(self, n)
 	return self.source:sub(i, i);
 end
 
--- Function to get the next char in the source
 local function get(self)
 	local i = self.index + 1;
 	if i > self.length then
@@ -190,7 +176,6 @@ local function get(self)
 	return self.source:sub(i, i);
 end
 
--- The same as get except it throws an Error if the char is not contained in charOrLookup
 local function expect(self, charOrLookup)
 	if(type(charOrLookup) == "string") then
 		charOrLookup = {[charOrLookup] = true};
@@ -210,7 +195,6 @@ local function expect(self, charOrLookup)
 	return char;
 end
 
--- Returns wether the n'th char is in the lookup
 local function is(self, charOrLookup, n)
 	local char = peek(self, n);
 	if(type(charOrLookup) == "string") then
@@ -235,7 +219,6 @@ function Tokenizer:parseAnnotation()
 	return get(self);
 end
 
--- skip one or 0 Comments and return wether one was found
 function Tokenizer:skipComment()
 	if(is(self, "-", 0) and is(self, "-", 1)) then
 		self.index = self.index + 2;
@@ -247,8 +230,7 @@ function Tokenizer:skipComment()
 				eqCount = eqCount + 1;
 			end
 			if(is(self, "[")) then
-				-- Multiline Comment
-				-- Get all Chars to Closing bracket but also consider that the count of equal signs must be the same
+
 				while true do
 					if(self:parseAnnotation() == ']') then
 						local eqCount2 = 0;
@@ -266,15 +248,13 @@ function Tokenizer:skipComment()
 				end
 			end
 		end
-		-- Single Line Comment
-		-- Get all Chars to next Newline
+
 		while(self.index < self.length and self:parseAnnotation() ~= "\n") do end
 		return true;
 	end
 	return false;
 end
 
--- skip All Whitespace and Comments to next Token
 function Tokenizer:skipWhitespaceAndComments()
 	while self:skipComment() do end
 	while is(self, Tokenizer.WHITESPACE_CHARS) do
@@ -297,7 +277,6 @@ local function int(self, chars, seperators)
 	return table.concat(buffer);
 end
 
--- Lex the next token as a Number
 function Tokenizer:number()
 	local startPos = self.index;
 	local source = expect(self, setmetatable({["."] = true}, {__index = self.NumberCharsLookup}));
@@ -343,13 +322,12 @@ function Tokenizer:number()
 	return token(self, startPos, Tokenizer.TokenKind.Number, value);
 end
 
--- Lex the Next Token as Identifier or Keyword
 function Tokenizer:ident()
 	local startPos = self.index;
 	local source = expect(self, self.IdentCharsLookup)
 	local sourceAddContent = {source}
 	while(is(self, self.IdentCharsLookup)) do
-		-- source = source .. get(self);
+
 		table.insert(sourceAddContent, get(self))
 	end
 	source = table.concat(sourceAddContent)
@@ -360,8 +338,8 @@ function Tokenizer:ident()
 	local tk = token(self, startPos, Tokenizer.TokenKind.Ident, source);
 
 	if(not self.allowInternalIdentifiers
-		and string.sub(source, 1, string.len(config.IdentPrefix)) == config.IdentPrefix) then
-		logger:warn(generateWarning(tk, string.format("identifiers should not start with \"%s\" as this may break the program", config.IdentPrefix)));
+		and string.sub(source, 1, string.len(IDENT_PREFIX)) == IDENT_PREFIX) then
+		logger:warn(generateWarning(tk, string.format("identifiers should not start with \"%s\" as this may break the program", IDENT_PREFIX)));
 	end
 
 	return tk;
@@ -375,12 +353,10 @@ function Tokenizer:singleLineString()
 	while (not is(self, startChar)) do
 		local char = get(self);
 
-		-- Single Line String may not contain Linebreaks except when they are escaped by \
 		if(char == '\n') then
 			self.index = self.index - 1;
 			logger:error(generateError(self, "Unterminated String"));
 		end
-
 
 		if(char == "\\") then
 			char = get(self);
@@ -423,7 +399,6 @@ function Tokenizer:singleLineString()
 			end
 		end
 
-		--// since table.insert is slower in lua51
 		buffer[#buffer + 1] = char
 	end
 
@@ -442,10 +417,7 @@ function Tokenizer:multiLineString()
 			eqCount = eqCount + 1;
 		end
 		if(is(self, "[")) then
-			-- Multiline String
-			-- Parse String to Closing bracket but also consider that the count of equal signs must be the same
 
-			-- Skip Leading newline if existing
 			self.index = self.index + 1;
 			if(is(self, "\n")) then
 				self.index = self.index + 1;
@@ -472,7 +444,7 @@ function Tokenizer:multiLineString()
 		end
 	end
 	self.index = startPos;
-	return nil, false -- There was not an actual multiline string at the given Position
+	return nil, false
 end
 
 function Tokenizer:symbol()
@@ -487,10 +459,8 @@ function Tokenizer:symbol()
 	logger:error(generateError(self, "Unknown Symbol"));
 end
 
-
--- get the Next token
 function Tokenizer:next()
-	-- Skip All Whitespace before the token
+
 	self:skipWhitespaceAndComments();
 
 	local startPos = self.index;
@@ -498,40 +468,33 @@ function Tokenizer:next()
 		return token(self, startPos, Tokenizer.TokenKind.Eof);
 	end
 
-	-- Numbers
 	if(is(self, self.NumberCharsLookup)) then
 		return self:number();
 	end
 
-	-- Identifiers and Keywords
 	if(is(self, self.IdentCharsLookup)) then
 		return self:ident();
 	end
 
-	-- Singleline String Literals
 	if(is(self, self.StringStartLookup)) then
 		return self:singleLineString();
 	end
 
-	-- Multiline String Literals
 	if(is(self, "[", 0)) then
-		-- The isString variable is due to the fact that "[" could also be a symbol for indexing
+
 		local value, isString = self:multiLineString();
 		if isString then
 			return value;
 		end
 	end
 
-	-- Number starting with dot
 	if(is(self, ".") and is(self, self.NumberCharsLookup, 1)) then
 		return self:number();
 	end
 
-	-- Symbols
 	if(is(self, self.SymbolCharsLookup)) then
 		return self:symbol();
 	end
-
 
 	logger:error(generateError(self, "Unexpected char \"" .. escape(peek(self)) .. "\"!"));
 end

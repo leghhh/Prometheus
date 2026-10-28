@@ -1,9 +1,3 @@
--- This Script is Part of the Prometheus Obfuscator by levno-710
---
--- enums.lua
---
--- This Script provides some enums used by the Obfuscator.
-
 local Enums = {};
 
 local chararray = require("prometheus.util").chararray;
