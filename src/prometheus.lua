@@ -19,6 +19,7 @@ package.path = oldPkgPath
 
 return {
     Deobfuscator = Deobfuscator,
+    Detector = Deobfuscator.Detector,
     Formatter = Formatter,
     Parser = Parser,
     Tokenizer = Tokenizer,

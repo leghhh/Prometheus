@@ -68,28 +68,31 @@ local function evalConstExpr(expr)
     return false, nil
 end
 
-local function parseNumberArray(tblExpr)
-    if tblExpr.kind ~= AstKind.TableConstructorExpression then return nil end
+local function parseNumberArray(tblExpr, resolveExpr)
+    if resolveExpr then tblExpr = resolveExpr(tblExpr) end
+    if not tblExpr or tblExpr.kind ~= AstKind.TableConstructorExpression then return nil end
     local out = {}
     for i = 1, #tblExpr.entries do
         local e = tblExpr.entries[i]
         if e.kind ~= AstKind.TableEntry then return nil end
-        local ok, v = evalConstExpr(e.value)
+        local valNode = resolveExpr and resolveExpr(e.value) or e.value
+        local ok, v = evalConstExpr(valNode)
         if not ok or type(v) ~= "number" then return nil end
         out[i] = v
     end
     return out
 end
 
-local function parsePrototypeTable(tblExpr)
-    if tblExpr.kind ~= AstKind.TableConstructorExpression then return nil end
+local function parsePrototypeTable(tblExpr, resolveExpr)
+    if resolveExpr then tblExpr = resolveExpr(tblExpr) end
+    if not tblExpr or tblExpr.kind ~= AstKind.TableConstructorExpression then return nil end
     local fields = {}
     for i = 1, #tblExpr.entries do
         local e = tblExpr.entries[i]
         if e.kind ~= AstKind.KeyedTableEntry or e.key.kind ~= AstKind.StringExpression then
             return nil
         end
-        fields[e.key.value] = e.value
+        fields[e.key.value] = resolveExpr and resolveExpr(e.value) or e.value
     end
     if not fields.code or not fields.constants or not fields.captures
         or not fields.params or not fields.vararg or not fields.children then
@@ -117,19 +120,22 @@ local function parsePrototypeTable(tblExpr)
     if fields.code.kind ~= AstKind.TableConstructorExpression then return nil end
     for i = 1, #fields.code.entries do
         local ce = fields.code.entries[i]
-        if ce.kind ~= AstKind.TableEntry or ce.value.kind ~= AstKind.TableConstructorExpression then
+        if ce.kind ~= AstKind.TableEntry then return nil end
+        local ceVal = resolveExpr and resolveExpr(ce.value) or ce.value
+        if not ceVal or ceVal.kind ~= AstKind.TableConstructorExpression then
             return nil
         end
         local row = {}
-        for j = 1, #ce.value.entries do
-            local se = ce.value.entries[j]
+        for j = 1, #ceVal.entries do
+            local se = ceVal.entries[j]
             if se.kind ~= AstKind.TableEntry then return nil end
-            if se.value.kind == AstKind.TableConstructorExpression then
-                local arr = parseNumberArray(se.value)
+            local seVal = resolveExpr and resolveExpr(se.value) or se.value
+            if seVal and seVal.kind == AstKind.TableConstructorExpression then
+                local arr = parseNumberArray(seVal, resolveExpr)
                 if not arr then return nil end
                 row[j] = arr
             else
-                local ok, v = evalConstExpr(se.value)
+                local ok, v = evalConstExpr(seVal)
                 if not ok then return nil end
                 row[j] = v
             end
@@ -141,7 +147,8 @@ local function parsePrototypeTable(tblExpr)
     for i = 1, #fields.constants.entries do
         local ke = fields.constants.entries[i]
         if ke.kind ~= AstKind.TableEntry then return nil end
-        local ok, v = evalConstExpr(ke.value)
+        local keVal = resolveExpr and resolveExpr(ke.value) or ke.value
+        local ok, v = evalConstExpr(keVal)
         if not ok then return nil end
         proto.constants[i] = v
     end
@@ -150,7 +157,7 @@ local function parsePrototypeTable(tblExpr)
     for i = 1, #fields.captures.entries do
         local ce = fields.captures.entries[i]
         if ce.kind ~= AstKind.TableEntry then return nil end
-        local pair = parseNumberArray(ce.value)
+        local pair = parseNumberArray(ce.value, resolveExpr)
         if not pair or #pair ~= 2 then return nil end
         proto.captures[i] = pair
     end
@@ -158,23 +165,27 @@ local function parsePrototypeTable(tblExpr)
     if fields.params.kind ~= AstKind.TableConstructorExpression then return nil end
     for i = 1, #fields.params.entries do
         local pe = fields.params.entries[i]
-        if pe.kind ~= AstKind.TableEntry or pe.value.kind ~= AstKind.TableConstructorExpression or #pe.value.entries ~= 2 then
+        if pe.kind ~= AstKind.TableEntry then return nil end
+        local peVal = resolveExpr and resolveExpr(pe.value) or pe.value
+        if not peVal or peVal.kind ~= AstKind.TableConstructorExpression or #peVal.entries ~= 2 then
             return nil
         end
-        local e1, e2 = pe.value.entries[1], pe.value.entries[2]
-        if e1.kind ~= AstKind.TableEntry or e2.kind ~= AstKind.TableEntry or e2.value.kind ~= AstKind.BooleanExpression then
+        local e1, e2 = peVal.entries[1], peVal.entries[2]
+        local e1Val = e1 and e1.kind == AstKind.TableEntry and (resolveExpr and resolveExpr(e1.value) or e1.value)
+        local e2Val = e2 and e2.kind == AstKind.TableEntry and (resolveExpr and resolveExpr(e2.value) or e2.value)
+        if not e1Val or not e2Val or e2Val.kind ~= AstKind.BooleanExpression then
             return nil
         end
-        local ok, reg = evalConstExpr(e1.value)
+        local ok, reg = evalConstExpr(e1Val)
         if not ok or type(reg) ~= "number" then return nil end
-        proto.params[i] = { reg, e2.value.value }
+        proto.params[i] = { reg, e2Val.value }
     end
 
     if fields.children.kind ~= AstKind.TableConstructorExpression then return nil end
     for i = 1, #fields.children.entries do
         local ch = fields.children.entries[i]
         if ch.kind ~= AstKind.TableEntry then return nil end
-        local childProto = parsePrototypeTable(ch.value)
+        local childProto = parsePrototypeTable(ch.value, resolveExpr)
         if not childProto then return nil end
         proto.children[i] = childProto
     end
@@ -557,7 +568,6 @@ local function extractLayout(vmRuntime, globalScope)
                 local sd = isRIndexSlot(s.condition.lhs)
                 if sd and sd == isRIndexSlot(s.condition.rhs) then
                     classified = "FORCHECK"
-                    slotD = sd
                 end
             end
         elseif #stmts == 2 then
@@ -627,13 +637,50 @@ local function extractLayout(vmRuntime, globalScope)
             local pcIfHasNot = false
 
             local nFieldVars = {}
+            local oneVars = {}
+            local rSlotVars = {}
             visitSub(body, function(n)
                 if n.kind == AstKind.AssignmentStatement and #n.lhs == 1 and #n.rhs == 1
-                    and n.lhs[1].kind == AstKind.AssignmentVariable
-                    and n.rhs[1].kind == AstKind.IndexExpression
-                    and n.rhs[1].index.kind == AstKind.StringExpression
-                    and n.rhs[1].index.value == "n" then
-                    nFieldVars[varKey(n.lhs[1].scope, n.lhs[1].id)] = true
+                    and n.lhs[1].kind == AstKind.AssignmentVariable then
+                    local lk = varKey(n.lhs[1].scope, n.lhs[1].id)
+                    local r = n.rhs[1]
+                    if r.kind == AstKind.IndexExpression
+                        and r.index.kind == AstKind.StringExpression
+                        and r.index.value == "n" then
+                        nFieldVars[lk] = true
+                    elseif r.kind == AstKind.NumberExpression and r.value == 1 then
+                        oneVars[lk] = true
+                    elseif r.kind == AstKind.VariableExpression then
+                        local rvk = varKey(r.scope, r.id)
+                        if nFieldVars[rvk] then nFieldVars[lk] = true end
+                        if oneVars[rvk] then oneVars[lk] = true end
+                    end
+                    local rsd = isRIndexSlot(r)
+                    if rsd then
+                        rSlotVars[lk] = rsd
+                    elseif r.kind == AstKind.VariableExpression and rSlotVars[varKey(r.scope, r.id)] then
+                        rSlotVars[lk] = rSlotVars[varKey(r.scope, r.id)]
+                    end
+                elseif n.kind == AstKind.LocalVariableDeclaration and #n.ids == 1 and n.expressions and #n.expressions == 1 then
+                    local lk = varKey(n.scope, n.ids[1])
+                    local r = n.expressions[1]
+                    if r.kind == AstKind.IndexExpression
+                        and r.index.kind == AstKind.StringExpression
+                        and r.index.value == "n" then
+                        nFieldVars[lk] = true
+                    elseif r.kind == AstKind.NumberExpression and r.value == 1 then
+                        oneVars[lk] = true
+                    elseif r.kind == AstKind.VariableExpression then
+                        local rvk = varKey(r.scope, r.id)
+                        if nFieldVars[rvk] then nFieldVars[lk] = true end
+                        if oneVars[rvk] then oneVars[lk] = true end
+                    end
+                    local rsd = isRIndexSlot(r)
+                    if rsd then
+                        rSlotVars[lk] = rsd
+                    elseif r.kind == AstKind.VariableExpression and rSlotVars[varKey(r.scope, r.id)] then
+                        rSlotVars[lk] = rSlotVars[varKey(r.scope, r.id)]
+                    end
                 end
             end, nil, globalScope)
 
@@ -668,13 +715,14 @@ local function extractLayout(vmRuntime, globalScope)
                 elseif n.kind == AstKind.WhileStatement or n.kind == AstKind.ForStatement or n.kind == AstKind.ForInStatement then
                     hasWhileOrFor = true
                 elseif n.kind == AstKind.NotEqualsExpression then
-                    local sd1 = isRIndexSlot(n.lhs)
-                    local sd2 = isRIndexSlot(n.rhs)
+                    local sd1 = isRIndexSlot(n.lhs) or (n.lhs.kind == AstKind.VariableExpression and rSlotVars[varKey(n.lhs.scope, n.lhs.id)])
+                    local sd2 = isRIndexSlot(n.rhs) or (n.rhs.kind == AstKind.VariableExpression and rSlotVars[varKey(n.rhs.scope, n.rhs.id)])
                     if sd1 and sd1 == sd2 then hasSelfNe = sd1 end
                 elseif n.kind == AstKind.ReturnStatement then
                     retList[#retList + 1] = n
                 elseif n.kind == AstKind.FunctionCallExpression then
-                    if #n.args == 3 and n.args[2].kind == AstKind.NumberExpression and n.args[2].value == 1 then
+                    if #n.args == 3 and ((n.args[2].kind == AstKind.NumberExpression and n.args[2].value == 1)
+                        or (n.args[2].kind == AstKind.VariableExpression and oneVars[varKey(n.args[2].scope, n.args[2].id)])) then
                         local a3 = n.args[3]
                         if (a3.kind == AstKind.IndexExpression and a3.index.kind == AstKind.StringExpression and a3.index.value == "n")
                             or (a3.kind == AstKind.VariableExpression and nFieldVars[varKey(a3.scope, a3.id)]) then
@@ -715,7 +763,6 @@ local function extractLayout(vmRuntime, globalScope)
                 classified = "FORPREP"
             elseif hasSelfNe then
                 classified = "FORCHECK"
-                slotD = slotD or hasSelfNe
             elseif hasNOneTbl then
                 if hasUnpackCall then
                     classified = "CALL"
@@ -1708,14 +1755,14 @@ local function liftPrototype(proto, parentLookup, globalScope, targetLuaVersion,
         if ins.op ~= "JFALSE" then return nil end
         local nextBranch = ins.b
         if nextBranch <= jpc or nextBranch > limitPc + 1 then return nil end
-        if loopCtx and (isLoopBreakTarget(loopCtx, nextBranch) or nextBranch == loopCtx.continueTarget) then
+        if loopCtx and isLoopBreakTarget(loopCtx, nextBranch) then
             return nil
         end
         local jmpBeforeNext = code[nextBranch - 1]
         if not jmpBeforeNext or jmpBeforeNext.op ~= "JMP" then return nil end
         local endPos = jmpBeforeNext.a
         if endPos < nextBranch or endPos > limitPc + 1 then return nil end
-        if loopCtx and (endPos == loopCtx.continueTarget or endPos < jpc) then
+        if loopCtx and endPos < jpc then
             return nil
         end
         return {
@@ -1826,7 +1873,27 @@ local function liftPrototype(proto, parentLookup, globalScope, targetLuaVersion,
                         hazard = true
                     end
                     if hazard then
-                        ordered[#ordered + 1] = { r = r, s = p.seq or 0 }
+                        if targetType == "reg" and p.isBuildingTable and hasPendingTableBuild(r, pc + 1) then
+                            local tb = regBindings[targetId]
+                            if tb and tb.declared then
+                                local snapId = scope:addVariable()
+                                stmts[#stmts + 1] = Ast.LocalVariableDeclaration(
+                                    scope,
+                                    { snapId },
+                                    { makeVarExpr(scope, tb.scope, tb.id) }
+                                )
+                                visitSub(p.expr, nil, function(m)
+                                    if m.kind == AstKind.VariableExpression and m.scope == tb.scope and m.id == tb.id then
+                                        return Ast.VariableExpression(scope, snapId)
+                                    end
+                                end, globalScope)
+                                p.deps["r:" .. tostring(targetId)] = nil
+                            else
+                                ordered[#ordered + 1] = { r = r, s = p.seq or 0 }
+                            end
+                        else
+                            ordered[#ordered + 1] = { r = r, s = p.seq or 0 }
+                        end
                     end
                 end
             end
@@ -2222,6 +2289,44 @@ local function liftPrototype(proto, parentLookup, globalScope, targetLuaVersion,
                     rhsExpr = rhsStmts[1].rhs[1]
                     rhsImpure = true
                     rhsStmts = {}
+                elseif #rhsStmts == 2
+                    and rhsStmts[1].kind == AstKind.AssignmentStatement and #rhsStmts[1].lhs == 1 and #rhsStmts[1].rhs == 1
+                    and rhsStmts[1].lhs[1].kind == AstKind.AssignmentVariable
+                    and rhsStmts[2].kind == AstKind.AssignmentStatement and #rhsStmts[2].lhs == 1 and #rhsStmts[2].rhs == 1
+                    and rhsStmts[2].lhs[1].kind == AstKind.AssignmentVariable
+                    and regBindings[sc.resReg] and rhsStmts[2].lhs[1].id == regBindings[sc.resReg].id
+                    and isVarRef(rhsStmts[2].rhs[1], rhsStmts[1].lhs[1].scope, rhsStmts[1].lhs[1].id) then
+                    local tmpId, tmpSc = rhsStmts[1].lhs[1].id, rhsStmts[1].lhs[1].scope
+                    local tmpReg = nil
+                    for rIdx, rb in pairs(regBindings) do
+                        if rb.scope == tmpSc and rb.id == tmpId then tmpReg = rIdx; break end
+                    end
+                    local tmpDeadAfter = false
+                    if tmpReg then
+                        tmpDeadAfter = true
+                        for pIdx = sc.endPos, #code do
+                            local pi = code[pIdx]
+                            local opN = pi.op
+                            if opN == "JMP" or opN == "JTRUE" or opN == "JFALSE" then
+                                if pi.a == tmpReg and opN ~= "JMP" then tmpDeadAfter = false end
+                                break
+                            end
+                            local readsTmp = (pi.b == tmpReg and opN ~= "LOAD" and opN ~= "LOADNIL" and opN ~= "CLOSURE")
+                                or (pi.c == tmpReg) or (pi.d == tmpReg)
+                            if readsTmp then tmpDeadAfter = false; break end
+                            if pi.a == tmpReg and opN ~= "SETTABLE" and opN ~= "SETUPVAL" then
+                                tmpDeadAfter = true
+                                break
+                            end
+                        end
+                    end
+                    if tmpDeadAfter then
+                        rhsExpr = rhsStmts[1].rhs[1]
+                        rhsImpure = true
+                        rhsStmts = {}
+                    else
+                        rhsAlreadyAssigned = true
+                    end
                 elseif rhsPending and rhsPending[sc.resReg] and rhsPending[sc.resReg].kind == "scalar" then
                     rhsExpr = rhsPending[sc.resReg].expr
                     rhsDeps = rhsPending[sc.resReg].deps or {}
@@ -3086,10 +3191,16 @@ local function isDeadCffSetupStmt(stmt)
                 and ex.kind ~= AstKind.VariableExpression
                 and ex.kind ~= AstKind.OrExpression
                 and ex.kind ~= AstKind.IndexExpression
-                and ex.kind ~= AstKind.TableConstructorExpression then
+                and ex.kind ~= AstKind.TableConstructorExpression
+                and ex.kind ~= AstKind.FunctionLiteralExpression
+                and ex.kind ~= AstKind.OrExpression
+                and ex.kind ~= AstKind.AndExpression
+                and ex.kind ~= AstKind.NegateExpression then
                 return false
             end
         end
+        return true
+    elseif stmt.kind == AstKind.LocalFunctionDeclaration then
         return true
     elseif stmt.kind == AstKind.AssignmentStatement then
         for _, r in ipairs(stmt.rhs) do
@@ -3099,7 +3210,11 @@ local function isDeadCffSetupStmt(stmt)
                 and r.kind ~= AstKind.BooleanExpression
                 and r.kind ~= AstKind.IndexExpression
                 and r.kind ~= AstKind.TableConstructorExpression
-                and r.kind ~= AstKind.VariableExpression then
+                and r.kind ~= AstKind.VariableExpression
+                and r.kind ~= AstKind.FunctionLiteralExpression
+                and r.kind ~= AstKind.OrExpression
+                and r.kind ~= AstKind.AndExpression
+                and r.kind ~= AstKind.NegateExpression then
                 return false
             end
         end
@@ -3108,85 +3223,279 @@ local function isDeadCffSetupStmt(stmt)
     return false
 end
 
-function VmDecompiler.decompile(ast, targetLuaVersion)
-    targetLuaVersion = targetLuaVersion or LuaVersion.Lua51
+local function buildLocalExprResolver(stmts, maxIdx)
+    local defs = {}
+    local function snap(expr, depth)
+        if not expr or (depth or 0) > 24 then return expr end
+        local d = (depth or 0) + 1
+        if expr.kind == AstKind.VariableExpression and not expr.scope.isGlobal then
+            local vk = varKey(expr.scope, expr.id)
+            if defs[vk] ~= nil then
+                return defs[vk]
+            end
+            return expr
+        elseif expr.kind == AstKind.TableConstructorExpression then
+            local entries = {}
+            for i = 1, #expr.entries do
+                local e = expr.entries[i]
+                if e.kind == AstKind.TableEntry then
+                    entries[i] = Ast.TableEntry(snap(e.value, d))
+                elseif e.kind == AstKind.KeyedTableEntry then
+                    entries[i] = Ast.KeyedTableEntry(snap(e.key, d), snap(e.value, d))
+                else
+                    entries[i] = e
+                end
+            end
+            return Ast.TableConstructorExpression(entries)
+        elseif expr.kind == AstKind.NegateExpression then
+            return Ast.NegateExpression(snap(expr.rhs, d))
+        elseif expr.kind == AstKind.DivExpression then
+            return Ast.DivExpression(snap(expr.lhs, d), snap(expr.rhs, d))
+        end
+        return expr
+    end
+    for k = 1, maxIdx do
+        local sk = stmts[k]
+        if sk.kind == AstKind.LocalVariableDeclaration then
+            local snapped = {}
+            for i = 1, #sk.ids do
+                local ex = sk.expressions and sk.expressions[i]
+                snapped[i] = ex and snap(ex, 0) or Ast.NilExpression()
+            end
+            for i = 1, #sk.ids do
+                defs[varKey(sk.scope, sk.ids[i])] = snapped[i]
+            end
+        elseif sk.kind == AstKind.AssignmentStatement then
+            local snapped = {}
+            for i = 1, #sk.lhs do
+                local ex = sk.rhs[i]
+                snapped[i] = ex and snap(ex, 0) or Ast.NilExpression()
+            end
+            for i = 1, #sk.lhs do
+                local lv = sk.lhs[i]
+                if lv.kind == AstKind.AssignmentVariable and not lv.scope.isGlobal then
+                    defs[varKey(lv.scope, lv.id)] = snapped[i]
+                elseif lv.kind == AstKind.AssignmentIndexing then
+                    local base = snap(lv.base, 0)
+                    local idx = snap(lv.index, 0)
+                    if base and base.kind == AstKind.TableConstructorExpression then
+                        if idx.kind == AstKind.NumberExpression then
+                            base.entries[idx.value] = Ast.TableEntry(snapped[i])
+                        elseif idx.kind == AstKind.StringExpression then
+                            local placed = false
+                            for j = 1, #base.entries do
+                                local ej = base.entries[j]
+                                if ej.kind == AstKind.KeyedTableEntry and ej.key.kind == AstKind.StringExpression
+                                    and ej.key.value == idx.value then
+                                    base.entries[j] = Ast.KeyedTableEntry(idx, snapped[i])
+                                    placed = true
+                                    break
+                                end
+                            end
+                            if not placed then
+                                base.entries[#base.entries + 1] = Ast.KeyedTableEntry(idx, snapped[i])
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return function(expr)
+        return snap(expr, 0)
+    end
+end
+
+local function resolveDataTblVar(stmts, maxIdx, varExpr)
+    local pSc, pId = varExpr.scope, varExpr.id
+    for k = maxIdx, 1, -1 do
+        local sk = stmts[k]
+        if sk.kind == AstKind.LocalVariableDeclaration and #sk.ids == 1 and sk.expressions and #sk.expressions == 1
+            and sk.scope == pSc and sk.ids[1] == pId then
+            local ex = sk.expressions[1]
+            if ex.kind == AstKind.TableConstructorExpression then
+                return ex, k
+            elseif ex.kind == AstKind.VariableExpression then
+                pSc, pId = ex.scope, ex.id
+            end
+        elseif sk.kind == AstKind.AssignmentStatement and #sk.lhs == 1 and #sk.rhs == 1
+            and sk.lhs[1].kind == AstKind.AssignmentVariable
+            and sk.lhs[1].scope == pSc and sk.lhs[1].id == pId then
+            local ex = sk.rhs[1]
+            if ex.kind == AstKind.TableConstructorExpression then
+                return ex, k
+            elseif ex.kind == AstKind.VariableExpression then
+                pSc, pId = ex.scope, ex.id
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function matchVmEntry(ast)
     local stmts = ast.body and ast.body.statements
-    if not stmts or #stmts == 0 then return false end
+    if not stmts or #stmts == 0 then return nil end
 
     local retStmt = stmts[#stmts]
-    if retStmt.kind ~= AstKind.ReturnStatement or #retStmt.args ~= 1 then return false end
+    if retStmt.kind ~= AstKind.ReturnStatement or #retStmt.args ~= 1 then return nil end
 
     local call = retStmt.args[1]
     local dataTbl = nil
     local vmSpanStart = #stmts
+    local resolveMaxIdx = #stmts - 1
 
     if call.kind == AstKind.FunctionCallExpression
         and not call.isParenthesizedExpression
         and call.base.kind == AstKind.FunctionLiteralExpression
         and #call.args == 2
         and call.args[2].kind == AstKind.VarargExpression then
-        dataTbl = call.args[1]
+        if call.args[1].kind == AstKind.TableConstructorExpression then
+            dataTbl = call.args[1]
+        elseif call.args[1].kind == AstKind.VariableExpression then
+            local resolved, defIdx = resolveDataTblVar(stmts, #stmts - 1, call.args[1])
+            if resolved then
+                dataTbl = resolved
+                vmSpanStart = defIdx
+            end
+        end
     elseif call.kind == AstKind.FunctionCallExpression
         and call.base.kind == AstKind.VariableExpression
-        and #call.args == 1
-        and call.args[1].kind == AstKind.VariableExpression then
-        local curSc, curId = call.args[1].scope, call.args[1].id
-        local foundVmCall = nil
-        local callStmtIdx = nil
-        for k = #stmts - 1, math.max(1, #stmts - 10), -1 do
-            local sk = stmts[k]
-            if sk.kind == AstKind.AssignmentStatement and #sk.lhs == 1 and #sk.rhs == 1
-                and sk.lhs[1].kind == AstKind.AssignmentVariable
-                and sk.lhs[1].scope == curSc and sk.lhs[1].id == curId then
-                local r = sk.rhs[1]
-                if r.kind == AstKind.VariableExpression then
-                    curSc, curId = r.scope, r.id
-                elseif r.kind == AstKind.FunctionCallExpression and #r.args == 1
-                    and r.args[1].kind == AstKind.FunctionCallExpression then
-                    local innerCall = r.args[1]
-                    if innerCall.base.kind == AstKind.FunctionLiteralExpression
-                        and #innerCall.args == 2
-                        and innerCall.args[2].kind == AstKind.VarargExpression then
-                        foundVmCall = innerCall
+        and #call.args == 1 then
+        if call.args[1].kind == AstKind.FunctionCallExpression then
+            local inner = call.args[1]
+            if inner.kind == AstKind.FunctionCallExpression and #inner.args == 1
+                and inner.args[1].kind == AstKind.FunctionCallExpression then
+                inner = inner.args[1]
+            end
+            if inner.base.kind == AstKind.FunctionLiteralExpression
+                and #inner.args == 2
+                and inner.args[2].kind == AstKind.VarargExpression then
+                call = inner
+                if inner.args[1].kind == AstKind.TableConstructorExpression then
+                    dataTbl = inner.args[1]
+                elseif inner.args[1].kind == AstKind.VariableExpression then
+                    local resolved, defIdx = resolveDataTblVar(stmts, #stmts - 1, inner.args[1])
+                    if resolved then
+                        dataTbl = resolved
+                        vmSpanStart = defIdx
+                    end
+                end
+            end
+        elseif call.args[1].kind == AstKind.VariableExpression then
+            local curSc, curId = call.args[1].scope, call.args[1].id
+            local foundVmCall = nil
+            local callStmtIdx = nil
+            for k = #stmts - 1, 1, -1 do
+                local sk = stmts[k]
+                if sk.kind == AstKind.AssignmentStatement and #sk.lhs == 1 and #sk.rhs == 1
+                    and sk.lhs[1].kind == AstKind.AssignmentVariable
+                    and sk.lhs[1].scope == curSc and sk.lhs[1].id == curId then
+                    local r = sk.rhs[1]
+                    if r.kind == AstKind.VariableExpression then
+                        curSc, curId = r.scope, r.id
+                    elseif r.kind == AstKind.FunctionCallExpression and #r.args == 1
+                        and r.args[1].kind == AstKind.FunctionCallExpression then
+                        local innerCall = r.args[1]
+                        if innerCall.base.kind == AstKind.FunctionLiteralExpression
+                            and #innerCall.args == 2
+                            and innerCall.args[2].kind == AstKind.VarargExpression then
+                            foundVmCall = innerCall
+                            callStmtIdx = k
+                            break
+                        end
+                    elseif r.kind == AstKind.FunctionCallExpression
+                        and r.base.kind == AstKind.FunctionLiteralExpression
+                        and #r.args == 2
+                        and r.args[2].kind == AstKind.VarargExpression then
+                        foundVmCall = r
                         callStmtIdx = k
                         break
                     end
-                elseif r.kind == AstKind.FunctionCallExpression
-                    and r.base.kind == AstKind.FunctionLiteralExpression
-                    and #r.args == 2
-                    and r.args[2].kind == AstKind.VarargExpression then
-                    foundVmCall = r
-                    callStmtIdx = k
-                    break
                 end
             end
-        end
-        if foundVmCall and callStmtIdx then
-            call = foundVmCall
-            vmSpanStart = callStmtIdx
-            if foundVmCall.args[1].kind == AstKind.TableConstructorExpression then
-                dataTbl = foundVmCall.args[1]
-            elseif foundVmCall.args[1].kind == AstKind.VariableExpression then
-                local pSc, pId = foundVmCall.args[1].scope, foundVmCall.args[1].id
-                for k = callStmtIdx - 1, math.max(1, callStmtIdx - 10), -1 do
-                    local sk = stmts[k]
-                    if sk.kind == AstKind.AssignmentStatement and #sk.lhs == 1 and #sk.rhs == 1
-                        and sk.lhs[1].kind == AstKind.AssignmentVariable
-                        and sk.lhs[1].scope == pSc and sk.lhs[1].id == pId
-                        and sk.rhs[1].kind == AstKind.TableConstructorExpression then
-                        dataTbl = sk.rhs[1]
-                        vmSpanStart = k
-                        break
+            if foundVmCall and callStmtIdx then
+                call = foundVmCall
+                vmSpanStart = callStmtIdx
+                resolveMaxIdx = callStmtIdx - 1
+                if foundVmCall.args[1].kind == AstKind.TableConstructorExpression then
+                    dataTbl = foundVmCall.args[1]
+                elseif foundVmCall.args[1].kind == AstKind.VariableExpression then
+                    local resolved, defIdx = resolveDataTblVar(stmts, callStmtIdx - 1, foundVmCall.args[1])
+                    if resolved then
+                        dataTbl = resolved
+                        vmSpanStart = defIdx
                     end
                 end
             end
         end
     end
 
-    if not dataTbl or dataTbl.kind ~= AstKind.TableConstructorExpression or #dataTbl.entries ~= 1 then return false end
-    if dataTbl.entries[1].kind ~= AstKind.TableEntry then return false end
+    local resolveExpr = buildLocalExprResolver(stmts, resolveMaxIdx)
+    if call and call.args and call.args[1] and call.args[1].kind == AstKind.VariableExpression then
+        local snappedArg = resolveExpr(call.args[1])
+        if snappedArg and snappedArg.kind == AstKind.TableConstructorExpression then
+            dataTbl = snappedArg
+        end
+    elseif dataTbl then
+        dataTbl = resolveExpr(dataTbl)
+    end
+    if not dataTbl or dataTbl.kind ~= AstKind.TableConstructorExpression or #dataTbl.entries ~= 1 then
+        return nil
+    end
+    if dataTbl.entries[1].kind ~= AstKind.TableEntry then
+        return nil
+    end
+    return {
+        stmts = stmts,
+        call = call,
+        dataTbl = dataTbl,
+        vmSpanStart = vmSpanStart,
+        resolveExpr = resolveExpr,
+    }
+end
 
-    local rootProto = parsePrototypeTable(dataTbl.entries[1].value)
+function VmDecompiler.detect(ast)
+    local entry = matchVmEntry(ast)
+    if not entry then
+        local hasProtoTable = false
+        visitast(ast, function(n)
+            if not hasProtoTable and n.kind == AstKind.TableConstructorExpression and #n.entries >= 6 then
+                local seen = {}
+                for i = 1, #n.entries do
+                    local e = n.entries[i]
+                    if e.kind == AstKind.KeyedTableEntry and e.key.kind == AstKind.StringExpression then
+                        seen[e.key.value] = true
+                    end
+                end
+                if seen.code and seen.constants and seen.captures and seen.params and seen.vararg and seen.children then
+                    hasProtoTable = true
+                end
+            end
+        end)
+        if hasProtoTable then
+            return { present = true, ready = false }
+        end
+        return nil
+    end
+    local rootProto = parsePrototypeTable(entry.dataTbl.entries[1].value, entry.resolveExpr)
+    if not rootProto then
+        return { present = true, ready = false }
+    end
+    local layout = extractLayout(entry.call.base, ast.globalScope)
+    return { present = true, ready = layout ~= nil }
+end
+
+function VmDecompiler.decompile(ast, targetLuaVersion)
+    targetLuaVersion = targetLuaVersion or LuaVersion.Lua51
+    local entry = matchVmEntry(ast)
+    if not entry then return false end
+
+    local stmts = entry.stmts
+    local call = entry.call
+    local dataTbl = entry.dataTbl
+    local vmSpanStart = entry.vmSpanStart
+
+    local rootProto = parsePrototypeTable(dataTbl.entries[1].value, entry.resolveExpr)
     if not rootProto then return false end
 
     local layout = extractLayout(call.base, ast.globalScope)

@@ -14,89 +14,54 @@ local LuaVersion = Enums.LuaVersion
 local Deobfuscator = {}
 Deobfuscator.__index = Deobfuscator
 
-local PASS_LIST = {
-    {
-        name = "FoldConstants",
-        run = function(ast)
-            return Passes.foldConstants(ast)
-        end,
-    },
-    {
-        name = "UnwrapFunction",
-        run = function(ast)
-            return Passes.unwrapFunction(ast)
-        end,
-    },
-    {
-        name = "ResolveConstantArray",
-        run = function(ast)
-            return Passes.resolveConstantArray(ast)
-        end,
-    },
-    {
-        name = "RemoveAntiTamper",
-        run = function(ast)
-            return Passes.removeAntiTamper(ast)
-        end,
-    },
-    {
-        name = "RemoveWatermarks",
-        run = function(ast)
-            return Passes.removeWatermarks(ast)
-        end,
-    },
-    {
-        name = "DecryptStrings",
-        run = function(ast)
-            return Passes.decryptStrings(ast)
-        end,
-    },
-    {
-        name = "UnsplitStrings",
-        run = function(ast)
-            return Passes.unsplitStrings(ast)
-        end,
-    },
-    {
-        name = "UnproxifyLocals",
-        run = function(ast)
-            return Passes.unproxifyLocals(ast)
-        end,
-    },
-    {
-        name = "UnflattenControlFlow",
-        run = function(ast, targetVer)
-            return CffDecompiler.unflatten(ast, targetVer)
-        end,
-    },
-    {
-        name = "SimplifyCells",
-        run = function(ast, _, passCounts)
-            if not passCounts or not passCounts["UnflattenControlFlow"] or passCounts["LiftVmBytecode"] then
-                return false
-            end
-            return Passes.simplifyCells(ast)
-        end,
-    },
-    {
-        name = "UnwrapFlattenVmBridge",
-        run = function(ast)
-            return Passes.unwrapFlattenVmBridge(ast)
-        end,
-    },
-    {
-        name = "LiftVmBytecode",
-        run = function(ast, targetVer)
-            return VmDecompiler.decompile(ast, targetVer)
-        end,
-    },
-    {
-        name = "RemoveAddedVarargs",
-        run = function(ast)
-            return Passes.removeAddedVarargs(ast)
-        end,
-    },
-}
+local Detector = {}
+
+function Detector.scan(ast)
+    local sig = Passes.detectSignatures(ast)
+    local cff = CffDecompiler.detect(ast)
+    local vm = VmDecompiler.detect(ast)
+
+    local layers = {}
+    if sig.wrapInFunction then layers[#layers + 1] = "WrapInFunction" end
+    if sig.packedReturns then layers[#layers + 1] = "PackedReturnBridge" end
+    if sig.foldConstants then layers[#layers + 1] = "NumbersToExpressions" end
+    if sig.splitStrings then layers[#layers + 1] = "SplitStrings" end
+    if sig.proxifyLocals then layers[#layers + 1] = "ProxifyLocals" end
+    if sig.constantArray then layers[#layers + 1] = "ConstantArray" end
+    if sig.antiTamper then layers[#layers + 1] = "AntiTamper" end
+    if sig.watermarks then layers[#layers + 1] = "Watermark" end
+    if sig.encryptStrings then layers[#layers + 1] = "EncryptStrings" end
+    if cff and cff.present then layers[#layers + 1] = "Cff" end
+    if sig.flattenVmBridge then layers[#layers + 1] = "FlattenVmBridge" end
+    if vm and vm.present then layers[#layers + 1] = "Vmify" end
+    if sig.addedVarargs then layers[#layers + 1] = "AddVararg" end
+
+    local firstPass = nil
+    if sig.foldConstants then firstPass = "FoldConstants"
+    elseif sig.wrapInFunction or sig.packedReturns then firstPass = "UnwrapFunction"
+    elseif sig.splitStrings then firstPass = "UnsplitStrings"
+    elseif sig.proxifyLocals then firstPass = "UnproxifyLocals"
+    elseif sig.constantArray then firstPass = "ResolveConstantArray"
+    elseif sig.antiTamper then firstPass = "RemoveAntiTamper"
+    elseif sig.watermarks then firstPass = "RemoveWatermarks"
+    elseif sig.encryptStrings then firstPass = "DecryptStrings"
+    elseif cff and cff.ready then firstPass = "UnflattenControlFlow"
+    elseif sig.flattenVmBridge then firstPass = "UnwrapFlattenVmBridge"
+    elseif vm and vm.ready then firstPass = "LiftVmBytecode"
+    elseif sig.addedVarargs then firstPass = "RemoveAddedVarargs"
+    end
+
+    return {
+        isPrometheus = #layers > 0,
+        layers = layers,
+        recommendedFirstPass = firstPass,
+        signatures = sig,
+        cff = cff,
+        vm = vm,
+    }
+end
+
+Deobfuscator.Detector = Detector
 
 local function isSyntheticOrMangledName(name)
     if type(name) ~= "string" or #name == 0 then
@@ -395,6 +360,13 @@ function Deobfuscator:parseSource(source)
     return astOrErr, detectedVer
 end
 
+function Deobfuscator:detect(source)
+    local ast, detectedVer = self:parseSource(source)
+    local info = Detector.scan(ast)
+    info.luaVersion = detectedVer
+    return info
+end
+
 function Deobfuscator:deobfuscateAst(ast, detectedVer)
     local targetVer = self.targetLuaVersion or detectedVer or LuaVersion.Lua51
     local savedLevel = Logger.logLevel
@@ -404,51 +376,210 @@ function Deobfuscator:deobfuscateAst(ast, detectedVer)
     local passCounts = {}
     local iterations = 0
     local hadStructuralPasses = false
+    local initialDetection = Detector.scan(ast)
+
+    local function recordPass(name)
+        if name ~= "FoldConstants" then
+            hadStructuralPasses = true
+        end
+        if not passCounts[name] then
+            passCounts[name] = 0
+            appliedPasses[#appliedPasses + 1] = name
+        end
+        passCounts[name] = passCounts[name] + 1
+    end
+
+    local function runResynthesis()
+        local changed = Passes.unwrapPackedReturns(ast)
+        if Passes.resynthesizeLogic(ast) then
+            changed = true
+            Passes.foldConstants(ast)
+            Passes.unwrapPackedReturns(ast)
+            Passes.resynthesizeLogic(ast)
+        end
+        if changed then
+            recordPass("ResynthesizeLogic")
+        end
+        return changed
+    end
+
+    local function maybeSimplifyCells()
+        if passCounts["UnflattenControlFlow"] and not passCounts["LiftVmBytecode"] then
+            if Passes.simplifyCells(ast) then
+                recordPass("SimplifyCells")
+                return true
+            end
+        end
+        return false
+    end
+
+    local function finishUnflatten()
+        if Passes.simplifyCells(ast) then
+            recordPass("SimplifyCells")
+        end
+        Passes.unwrapPackedReturns(ast)
+        if Passes.unwrapFunction(ast) then
+            recordPass("UnwrapFunction")
+        end
+        if Passes.unwrapFlattenVmBridge(ast) then
+            recordPass("UnwrapFlattenVmBridge")
+        end
+    end
+
+    local settledResynthesis = false
 
     local okRun, runErr = pcall(function()
-        for iter = 1, self.maxIterations do
-            local iterChanged = false
-            for _, pass in ipairs(PASS_LIST) do
-                local changed = pass.run(ast, targetVer, passCounts)
-                if changed then
-                    iterChanged = true
-                    if pass.name ~= "FoldConstants" then
-                        hadStructuralPasses = true
-                    end
-                    if not passCounts[pass.name] then
-                        passCounts[pass.name] = 0
-                        appliedPasses[#appliedPasses + 1] = pass.name
-                    end
-                    passCounts[pass.name] = passCounts[pass.name] + 1
-                end
+        local maxSteps = (self.maxIterations or 16) * 6
+        for step = 1, maxSteps do
+            local progressed = false
+
+            if Passes.foldConstants(ast) then
+                recordPass("FoldConstants")
+                progressed = true
             end
-            if iterChanged then
-                iterations = iter
+            if Passes.unwrapFunction(ast) then
+                recordPass("UnwrapFunction")
+                progressed = true
+            end
+
+            local scan = Detector.scan(ast)
+            local sig = scan.signatures
+
+            if sig.splitStrings and Passes.unsplitStrings(ast) then
+                recordPass("UnsplitStrings")
+                maybeSimplifyCells()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif sig.proxifyLocals and Passes.unproxifyLocals(ast) then
+                recordPass("UnproxifyLocals")
+                maybeSimplifyCells()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif sig.constantArray and Passes.resolveConstantArray(ast) then
+                recordPass("ResolveConstantArray")
+                maybeSimplifyCells()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif sig.encryptStrings and Passes.decryptStrings(ast) then
+                recordPass("DecryptStrings")
+                maybeSimplifyCells()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif sig.antiTamper and Passes.removeAntiTamper(ast) then
+                recordPass("RemoveAntiTamper")
+                maybeSimplifyCells()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif sig.watermarks and Passes.removeWatermarks(ast) then
+                recordPass("RemoveWatermarks")
+                maybeSimplifyCells()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif scan.cff and scan.cff.ready and CffDecompiler.unflatten(ast, targetVer) then
+                recordPass("UnflattenControlFlow")
+                finishUnflatten()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif sig.flattenVmBridge and Passes.unwrapFlattenVmBridge(ast) then
+                recordPass("UnwrapFlattenVmBridge")
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif scan.vm and scan.vm.ready and VmDecompiler.decompile(ast, targetVer) then
+                recordPass("LiftVmBytecode")
+                if Passes.removeAntiTamper(ast) then
+                    recordPass("RemoveAntiTamper")
+                end
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif Passes.unsplitStrings(ast) then
+                recordPass("UnsplitStrings")
+                maybeSimplifyCells()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif Passes.unproxifyLocals(ast) then
+                recordPass("UnproxifyLocals")
+                maybeSimplifyCells()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif Passes.resolveConstantArray(ast) then
+                recordPass("ResolveConstantArray")
+                maybeSimplifyCells()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif Passes.decryptStrings(ast) then
+                recordPass("DecryptStrings")
+                maybeSimplifyCells()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif Passes.removeAntiTamper(ast) then
+                recordPass("RemoveAntiTamper")
+                maybeSimplifyCells()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif Passes.removeWatermarks(ast) then
+                recordPass("RemoveWatermarks")
+                maybeSimplifyCells()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif CffDecompiler.unflatten(ast, targetVer) then
+                recordPass("UnflattenControlFlow")
+                finishUnflatten()
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif Passes.unwrapFlattenVmBridge(ast) then
+                recordPass("UnwrapFlattenVmBridge")
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif VmDecompiler.decompile(ast, targetVer) then
+                recordPass("LiftVmBytecode")
+                if Passes.removeAntiTamper(ast) then
+                    recordPass("RemoveAntiTamper")
+                end
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif sig.addedVarargs and Passes.removeAddedVarargs(ast) then
+                recordPass("RemoveAddedVarargs")
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif progressed then
+                settledResynthesis = false
+                iterations = iterations + 1
+            elseif hadStructuralPasses and not settledResynthesis then
+                settledResynthesis = true
+                local unlocked = runResynthesis()
+                if maybeSimplifyCells() then
+                    unlocked = true
+                    runResynthesis()
+                end
+                if Passes.unwrapFunction(ast) then
+                    recordPass("UnwrapFunction")
+                    unlocked = true
+                end
+                if Passes.removeAddedVarargs(ast) then
+                    recordPass("RemoveAddedVarargs")
+                    unlocked = true
+                end
+                if unlocked then
+                    iterations = iterations + 1
+                else
+                    break
+                end
             else
                 break
             end
         end
 
-        if hadStructuralPasses then
-            if Passes.resynthesizeLogic(ast) then
-                Passes.foldConstants(ast)
-                Passes.resynthesizeLogic(ast)
-                if not passCounts["ResynthesizeLogic"] then
-                    passCounts["ResynthesizeLogic"] = 0
-                    appliedPasses[#appliedPasses + 1] = "ResynthesizeLogic"
-                end
-                passCounts["ResynthesizeLogic"] = passCounts["ResynthesizeLogic"] + 1
+        if hadStructuralPasses and not settledResynthesis then
+            runResynthesis()
+            if Passes.removeAddedVarargs(ast) then
+                recordPass("RemoveAddedVarargs")
             end
         end
 
         if self.normalizeIdentifiers then
             local renamed = normalizeIdentifiers(ast, targetVer, hadStructuralPasses)
             if renamed then
-                if not passCounts["NormalizeIdentifiers"] then
-                    passCounts["NormalizeIdentifiers"] = 0
-                    appliedPasses[#appliedPasses + 1] = "NormalizeIdentifiers"
-                end
-                passCounts["NormalizeIdentifiers"] = passCounts["NormalizeIdentifiers"] + 1
+                recordPass("NormalizeIdentifiers")
             end
         end
     end)
@@ -460,6 +591,7 @@ function Deobfuscator:deobfuscateAst(ast, detectedVer)
 
     return {
         luaVersion = targetVer,
+        detected = initialDetection,
         iterations = iterations,
         appliedPasses = appliedPasses,
         passCounts = passCounts,

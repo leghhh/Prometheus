@@ -241,8 +241,313 @@ local function effectiveArgCount(args)
     return n, false
 end
 
+local function isSelectExpr(expr, selectAliases)
+    if not expr then return false end
+    if expr.kind == AstKind.VariableExpression then
+        if expr.scope.isGlobal and expr.scope:getVariableName(expr.id) == "select" then
+            return true
+        end
+        return selectAliases[varKey(expr.scope, expr.id)] == true
+    end
+    return false
+end
+
+local function isUnpackExpr(expr, unpackAliases)
+    if not expr then return false end
+    if expr.kind == AstKind.VariableExpression then
+        if expr.scope.isGlobal and expr.scope:getVariableName(expr.id) == "unpack" then
+            return true
+        end
+        return unpackAliases[varKey(expr.scope, expr.id)] == true
+    elseif expr.kind == AstKind.OrExpression then
+        return expr.lhs.kind == AstKind.VariableExpression and expr.lhs.scope.isGlobal
+            and expr.lhs.scope:getVariableName(expr.lhs.id) == "unpack"
+            and expr.rhs.kind == AstKind.IndexExpression
+    elseif expr.kind == AstKind.IndexExpression then
+        return expr.base.kind == AstKind.VariableExpression and expr.base.scope.isGlobal
+            and expr.base.scope:getVariableName(expr.base.id) == "table"
+            and expr.index.kind == AstKind.StringExpression and expr.index.value == "unpack"
+    end
+    return false
+end
+
+local function isPackHelperFn(args, body, selectAliases)
+    if not args or #args ~= 1 or args[1].kind ~= AstKind.VarargExpression then return false end
+    local bstmts = body and body.statements
+    if not bstmts or #bstmts ~= 1 or bstmts[1].kind ~= AstKind.ReturnStatement or #bstmts[1].args ~= 1 then
+        return false
+    end
+    local tbl = bstmts[1].args[1]
+    if tbl.kind ~= AstKind.TableConstructorExpression or #tbl.entries ~= 2 then return false end
+    local hasN, hasVararg = false, false
+    for i = 1, 2 do
+        local e = tbl.entries[i]
+        if e.kind == AstKind.KeyedTableEntry and e.key.kind == AstKind.StringExpression and e.key.value == "n"
+            and e.value.kind == AstKind.FunctionCallExpression and isSelectExpr(e.value.base, selectAliases)
+            and #e.value.args == 2 and e.value.args[1].kind == AstKind.StringExpression and e.value.args[1].value == "#"
+            and e.value.args[2].kind == AstKind.VarargExpression then
+            hasN = true
+        elseif e.kind == AstKind.TableEntry and e.value.kind == AstKind.VarargExpression then
+            hasVararg = true
+        end
+    end
+    return hasN and hasVararg
+end
+
+local function isUnpackNHelperFn(args, body, unpackAliases)
+    if not args or #args ~= 1 or args[1].kind ~= AstKind.VariableExpression then return false end
+    local tSc, tId = args[1].scope, args[1].id
+    local bstmts = body and body.statements
+    if not bstmts or #bstmts ~= 1 or bstmts[1].kind ~= AstKind.ReturnStatement or #bstmts[1].args ~= 1 then
+        return false
+    end
+    local call = bstmts[1].args[1]
+    if call.kind ~= AstKind.FunctionCallExpression or not isUnpackExpr(call.base, unpackAliases) or #call.args ~= 3 then
+        return false
+    end
+    return isVarRef(call.args[1], tSc, tId)
+        and call.args[2].kind == AstKind.NumberExpression and call.args[2].value == 1
+        and call.args[3].kind == AstKind.IndexExpression and isVarRef(call.args[3].base, tSc, tId)
+        and call.args[3].index.kind == AstKind.StringExpression and call.args[3].index.value == "n"
+end
+
+function Passes.unwrapPackedReturns(ast)
+    local anyChanged = false
+    for _ = 1, 4 do
+        local roundChanged = false
+        local _, writes = countVarUsage(ast)
+        local selectAliases = {}
+        local unpackAliases = {}
+        local packHelpers = {}
+        local unpackHelpers = {}
+
+        visitast(ast, function(node)
+            if node.kind == AstKind.LocalVariableDeclaration and #node.ids == 1 and node.expressions and #node.expressions == 1 then
+                local k = varKey(node.scope, node.ids[1])
+                if (writes[k] or 0) == 1 then
+                    local ex = node.expressions[1]
+                    if isSelectExpr(ex, selectAliases) then
+                        selectAliases[k] = true
+                    elseif isUnpackExpr(ex, unpackAliases) then
+                        unpackAliases[k] = true
+                    end
+                end
+            elseif node.kind == AstKind.AssignmentStatement and #node.lhs == 1 and #node.rhs == 1
+                and node.lhs[1].kind == AstKind.AssignmentVariable and not node.lhs[1].scope.isGlobal then
+                local k = varKey(node.lhs[1].scope, node.lhs[1].id)
+                if (writes[k] or 0) == 1 then
+                    local ex = node.rhs[1]
+                    if isSelectExpr(ex, selectAliases) then
+                        selectAliases[k] = true
+                    elseif isUnpackExpr(ex, unpackAliases) then
+                        unpackAliases[k] = true
+                    end
+                end
+            end
+        end)
+
+        visitast(ast, function(node)
+            if node.kind == AstKind.LocalFunctionDeclaration then
+                local k = varKey(node.scope, node.id)
+                if (writes[k] or 0) <= 1 then
+                    if isPackHelperFn(node.args, node.body, selectAliases) then
+                        packHelpers[k] = true
+                    elseif isUnpackNHelperFn(node.args, node.body, unpackAliases) then
+                        unpackHelpers[k] = true
+                    end
+                end
+            elseif node.kind == AstKind.LocalVariableDeclaration and #node.ids == 1 and node.expressions and #node.expressions == 1
+                and node.expressions[1].kind == AstKind.FunctionLiteralExpression then
+                local k = varKey(node.scope, node.ids[1])
+                local fn = node.expressions[1]
+                if (writes[k] or 0) == 1 then
+                    if isPackHelperFn(fn.args, fn.body, selectAliases) then
+                        packHelpers[k] = true
+                    elseif isUnpackNHelperFn(fn.args, fn.body, unpackAliases) then
+                        unpackHelpers[k] = true
+                    end
+                end
+            elseif node.kind == AstKind.AssignmentStatement and #node.lhs == 1 and #node.rhs == 1
+                and node.lhs[1].kind == AstKind.AssignmentVariable and not node.lhs[1].scope.isGlobal
+                and node.rhs[1].kind == AstKind.FunctionLiteralExpression then
+                local k = varKey(node.lhs[1].scope, node.lhs[1].id)
+                local fn = node.rhs[1]
+                if (writes[k] or 0) == 1 then
+                    if isPackHelperFn(fn.args, fn.body, selectAliases) then
+                        packHelpers[k] = true
+                    elseif isUnpackNHelperFn(fn.args, fn.body, unpackAliases) then
+                        unpackHelpers[k] = true
+                    end
+                end
+            end
+        end)
+
+        if next(packHelpers) ~= nil and next(unpackHelpers) ~= nil then
+            visitast(ast, nil, function(node)
+                if node.kind == AstKind.FunctionCallExpression
+                    and node.base.kind == AstKind.VariableExpression
+                    and unpackHelpers[varKey(node.base.scope, node.base.id)]
+                    and #node.args == 1
+                    and node.args[1].kind == AstKind.FunctionCallExpression
+                    and node.args[1].base.kind == AstKind.VariableExpression
+                    and packHelpers[varKey(node.args[1].base.scope, node.args[1].base.id)]
+                    and #node.args[1].args == 1 then
+                    local inner = node.args[1].args[1]
+                    if node.isParenthesizedExpression then
+                        inner.isParenthesizedExpression = true
+                    end
+                    roundChanged = true
+                    return inner
+                end
+            end)
+
+            visitast(ast, function(blk)
+                if blk.kind ~= AstKind.Block then return end
+                local stmts = blk.statements
+                if #stmts >= 2 and stmts[#stmts].kind == AstKind.ReturnStatement and #stmts[#stmts].args == 1 then
+                    local retCall = stmts[#stmts].args[1]
+                    if retCall.kind == AstKind.FunctionCallExpression and not retCall.isParenthesizedExpression
+                        and retCall.base.kind == AstKind.VariableExpression
+                        and unpackHelpers[varKey(retCall.base.scope, retCall.base.id)]
+                        and #retCall.args == 1 and retCall.args[1].kind == AstKind.VariableExpression then
+                        local curSc, curId = retCall.args[1].scope, retCall.args[1].id
+                        local packIdx, packedExpr = nil, nil
+                        for k = #stmts - 1, 1, -1 do
+                            local sk = stmts[k]
+                            if sk.kind == AstKind.AssignmentStatement and #sk.lhs == 1 and #sk.rhs == 1
+                                and sk.lhs[1].kind == AstKind.AssignmentVariable then
+                                if sk.lhs[1].scope == curSc and sk.lhs[1].id == curId then
+                                    local r = sk.rhs[1]
+                                    if r.kind == AstKind.VariableExpression then
+                                        curSc, curId = r.scope, r.id
+                                    elseif r.kind == AstKind.FunctionCallExpression
+                                        and r.base.kind == AstKind.VariableExpression
+                                        and packHelpers[varKey(r.base.scope, r.base.id)]
+                                        and #r.args == 1 then
+                                        packIdx, packedExpr = k, r.args[1]
+                                        break
+                                    else
+                                        break
+                                    end
+                                elseif sk.rhs[1].kind ~= AstKind.NilExpression then
+                                    break
+                                end
+                            elseif sk.kind == AstKind.LocalVariableDeclaration and #sk.ids == 1
+                                and sk.expressions and #sk.expressions == 1
+                                and sk.scope == curSc and sk.ids[1] == curId then
+                                local r = sk.expressions[1]
+                                if r.kind == AstKind.VariableExpression then
+                                    curSc, curId = r.scope, r.id
+                                elseif r.kind == AstKind.FunctionCallExpression
+                                    and r.base.kind == AstKind.VariableExpression
+                                    and packHelpers[varKey(r.base.scope, r.base.id)]
+                                    and #r.args == 1 then
+                                    packIdx, packedExpr = k, r.args[1]
+                                    break
+                                else
+                                    break
+                                end
+                            else
+                                break
+                            end
+                        end
+                        if packIdx and packedExpr then
+                            for k = #stmts, packIdx + 1, -1 do
+                                table.remove(stmts, k)
+                            end
+                            stmts[packIdx] = Ast.ReturnStatement({ packedExpr })
+                            roundChanged = true
+                        end
+                    end
+                end
+            end)
+        end
+
+        visitast(ast, function(blk)
+            if blk.kind ~= AstKind.Block then return end
+            local stmts = blk.statements
+            local i = 1
+            while i <= #stmts do
+                local s = stmts[i]
+                if s.kind == AstKind.DoStatement and s.body
+                    and s.body.scope and #s.body.scope.variables == 0 then
+                    local hasLocals = false
+                    for _, ds in ipairs(s.body.statements) do
+                        if ds.kind == AstKind.LocalVariableDeclaration or ds.kind == AstKind.LocalFunctionDeclaration then
+                            hasLocals = true
+                            break
+                        end
+                    end
+                    if not hasLocals then
+                        local childScopes = {}
+                        for _, cs in ipairs(s.body.scope.children or {}) do
+                            childScopes[#childScopes + 1] = cs
+                        end
+                        for _, cs in ipairs(childScopes) do
+                            cs:setParent(blk.scope)
+                        end
+                        if s.body.scope.parentScope then
+                            s.body.scope.parentScope:removeChild(s.body.scope)
+                        end
+                        table.remove(stmts, i)
+                        for j = 1, #s.body.statements do
+                            table.insert(stmts, i + j - 1, s.body.statements[j])
+                        end
+                        roundChanged = true
+                    else
+                        i = i + 1
+                    end
+                else
+                    i = i + 1
+                end
+            end
+        end)
+
+        if roundChanged then
+            local postReads = countVarUsage(ast)
+            visitast(ast, function(blk)
+                if blk.kind ~= AstKind.Block then return end
+                local stmts = blk.statements
+                local i = 1
+                while i <= #stmts do
+                    local s = stmts[i]
+                    local kill = false
+                    if s.kind == AstKind.LocalFunctionDeclaration then
+                        local k = varKey(s.scope, s.id)
+                        if (packHelpers[k] or unpackHelpers[k]) and (postReads[k] or 0) == 0 then
+                            kill = true
+                        end
+                    elseif s.kind == AstKind.LocalVariableDeclaration and #s.ids == 1 then
+                        local k = varKey(s.scope, s.ids[1])
+                        if (packHelpers[k] or unpackHelpers[k] or selectAliases[k] or unpackAliases[k])
+                            and (postReads[k] or 0) == 0 then
+                            kill = true
+                        end
+                    elseif s.kind == AstKind.AssignmentStatement and #s.lhs == 1
+                        and s.lhs[1].kind == AstKind.AssignmentVariable and not s.lhs[1].scope.isGlobal then
+                        local k = varKey(s.lhs[1].scope, s.lhs[1].id)
+                        if (packHelpers[k] or unpackHelpers[k] or selectAliases[k] or unpackAliases[k])
+                            and (postReads[k] or 0) == 0 then
+                            kill = true
+                        end
+                    end
+                    if kill then
+                        table.remove(stmts, i)
+                    else
+                        i = i + 1
+                    end
+                end
+            end)
+            anyChanged = true
+        else
+            break
+        end
+    end
+    return anyChanged
+end
+
 function Passes.unwrapFunction(ast)
-    local unwrapped = false
+    local unwrapped = Passes.unwrapPackedReturns(ast)
     while true do
         local stmts = ast.body and ast.body.statements
         if not stmts or #stmts == 0 then break end
@@ -255,17 +560,108 @@ function Passes.unwrapFunction(ast)
         if fn.kind ~= AstKind.FunctionLiteralExpression then break end
         if #fn.args ~= 1 or fn.args[1].kind ~= AstKind.VarargExpression then break end
 
-        if #stmts == 1 then
+        local priorAllDead = true
+        for k = 1, #stmts - 1 do
+            local sk = stmts[k]
+            if sk.kind ~= AstKind.LocalVariableDeclaration or (sk.expressions and #sk.expressions > 0) then
+                priorAllDead = false
+                break
+            end
+        end
+
+        if #stmts == 1 or priorAllDead then
             fn.body.scope:setParent(ast.globalScope)
             ast.body = fn.body
         else
-            fn.body.scope:setParent(ast.body.scope)
-            table.remove(stmts, #stmts)
+            local canHoistPrelude = true
+            for k = 1, #stmts - 1 do
+                local sk = stmts[k]
+                if sk.kind ~= AstKind.LocalVariableDeclaration
+                    and sk.kind ~= AstKind.LocalFunctionDeclaration
+                    and sk.kind ~= AstKind.AssignmentStatement then
+                    canHoistPrelude = false
+                    break
+                end
+            end
+            if not canHoistPrelude then break end
+            local oldScope = ast.body.scope
+            local newScope = fn.body.scope
+            local idMap = {}
+            local function mapId(id)
+                if not idMap[id] then
+                    idMap[id] = newScope:addVariable(oldScope:getVariableName(id))
+                end
+                return idMap[id]
+            end
+            local merged = {}
+            for k = 1, #stmts - 1 do
+                merged[#merged + 1] = stmts[k]
+            end
             for i = 1, #fn.body.statements do
-                stmts[#stmts + 1] = fn.body.statements[i]
+                merged[#merged + 1] = fn.body.statements[i]
+            end
+            fn.body.statements = merged
+            ast.body = fn.body
+            local liveScopes = { [ast.globalScope] = true, [newScope] = true }
+            visitast(ast, function(n)
+                if n.scope then
+                    liveScopes[n.scope] = true
+                    if n.scope.variablesFromHigherScopes then
+                        n.scope.variablesFromHigherScopes[oldScope] = nil
+                    end
+                end
+                if n.body and n.body.scope then
+                    liveScopes[n.body.scope] = true
+                    if n.body.scope.variablesFromHigherScopes then
+                        n.body.scope.variablesFromHigherScopes[oldScope] = nil
+                    end
+                end
+                if n.kind == AstKind.LocalVariableDeclaration and n.scope == oldScope then
+                    n.scope = newScope
+                    for j = 1, #n.ids do n.ids[j] = mapId(n.ids[j]) end
+                elseif (n.kind == AstKind.LocalFunctionDeclaration or n.kind == AstKind.FunctionDeclaration)
+                    and n.scope == oldScope then
+                    n.scope = newScope
+                    n.id = mapId(n.id)
+                elseif (n.kind == AstKind.VariableExpression or n.kind == AstKind.AssignmentVariable)
+                    and n.scope == oldScope then
+                    n.scope = newScope
+                    n.id = mapId(n.id)
+                    newScope:addReferenceToHigherScope(newScope, n.id)
+                end
+            end)
+            for sc in pairs(liveScopes) do
+                if sc.variablesFromHigherScopes then
+                    for hs in pairs(sc.variablesFromHigherScopes) do
+                        if hs == oldScope or not liveScopes[hs] then
+                            sc.variablesFromHigherScopes[hs] = nil
+                        end
+                    end
+                end
+                if sc.children then
+                    for idx = #sc.children, 1, -1 do
+                        if not liveScopes[sc.children[idx]] then
+                            table.remove(sc.children, idx)
+                        end
+                    end
+                end
+            end
+            newScope:setParent(ast.globalScope)
+            local childScopes = {}
+            for _, cs in ipairs(oldScope.children or {}) do
+                if cs ~= newScope and liveScopes[cs] then
+                    childScopes[#childScopes + 1] = cs
+                end
+            end
+            for _, cs in ipairs(childScopes) do
+                cs:setParent(newScope)
+            end
+            if oldScope.parentScope then
+                oldScope.parentScope:removeChild(oldScope)
             end
         end
         unwrapped = true
+        Passes.unwrapPackedReturns(ast)
     end
     return unwrapped
 end
@@ -633,6 +1029,34 @@ local function isTamperErrFunction(fn)
     return foundTamper
 end
 
+local function isSanityDoBlock(stmt)
+    if not stmt or stmt.kind ~= AstKind.DoStatement or not stmt.body then return false end
+    local hasZeroFor = false
+    local hasInfWhile = false
+    local hasCall = false
+    local ownedScopes = {}
+    local mutatesExternal = false
+    visitNode(stmt, function(n)
+        if n.kind == AstKind.Block or n.kind == AstKind.ForStatement or n.kind == AstKind.ForInStatement then
+            if n.scope then ownedScopes[n.scope] = true end
+        end
+    end)
+    visitNode(stmt, function(n)
+        if n.kind == AstKind.ForStatement and n.initialValue.kind == AstKind.NumberExpression and n.initialValue.value == 0 then
+            hasZeroFor = true
+        elseif n.kind == AstKind.WhileStatement and n.condition.kind == AstKind.BooleanExpression and n.condition.value == true then
+            hasInfWhile = true
+        elseif n.kind == AstKind.FunctionCallExpression or n.kind == AstKind.PassSelfFunctionCallExpression
+            or n.kind == AstKind.FunctionCallStatement or n.kind == AstKind.PassSelfFunctionCallStatement then
+            hasCall = true
+        elseif (n.kind == AstKind.AssignmentVariable or n.kind == AstKind.FunctionDeclaration)
+            and (n.scope.isGlobal or not ownedScopes[n.scope]) then
+            mutatesExternal = true
+        end
+    end)
+    return hasZeroFor and hasInfWhile and not hasCall and not mutatesExternal
+end
+
 function Passes.removeAntiTamper(ast)
     local removed = false
     visitast(ast, function(node)
@@ -640,7 +1064,10 @@ function Passes.removeAntiTamper(ast)
             local stmts = node.statements
             local i = 1
             while i <= #stmts do
-                if isAntiTamperDoBlock(stmts[i]) then
+                if isAntiTamperDoBlock(stmts[i]) or isSanityDoBlock(stmts[i]) then
+                    if stmts[i].body and stmts[i].body.scope and stmts[i].body.scope.parentScope then
+                        stmts[i].body.scope.parentScope:removeChild(stmts[i].body.scope)
+                    end
                     table.remove(stmts, i)
                     removed = true
                 elseif stmts[i].kind == AstKind.IfStatement
@@ -658,9 +1085,8 @@ function Passes.removeAntiTamper(ast)
                         end
                     end
 
-                    local startIdx = ifIdx
                     if errIdx then
-                        startIdx = errIdx
+                        local startIdx = errIdx
                         local sanityCellSc, sanityCellId
                         for k = errIdx - 1, math.max(1, errIdx - 20), -1 do
                             local sk = stmts[k]
@@ -683,51 +1109,129 @@ function Passes.removeAntiTamper(ast)
                             end
                         end
 
-                        if sanityCellSc then
-                            local wIdx = startIdx - 1
-                            while wIdx >= 1
-                                and stmts[wIdx].kind == AstKind.AssignmentStatement
-                                and #stmts[wIdx].rhs == 1
-                                and stmts[wIdx].rhs[1].kind == AstKind.NilExpression do
-                                wIdx = wIdx - 1
+                        local wIdx = startIdx - 1
+                        while wIdx >= 1
+                            and stmts[wIdx].kind == AstKind.AssignmentStatement
+                            and #stmts[wIdx].rhs == 1
+                            and stmts[wIdx].rhs[1].kind == AstKind.NilExpression do
+                            wIdx = wIdx - 1
+                        end
+
+                        if wIdx >= 1 and isSanityDoBlock(stmts[wIdx]) then
+                            if stmts[wIdx].body and stmts[wIdx].body.scope and stmts[wIdx].body.scope.parentScope then
+                                stmts[wIdx].body.scope.parentScope:removeChild(stmts[wIdx].body.scope)
                             end
-                            if wIdx >= 1 and stmts[wIdx].kind == AstKind.WhileStatement then
+                            startIdx = wIdx
+                        elseif wIdx >= 1 and (stmts[wIdx].kind == AstKind.WhileStatement or stmts[wIdx].kind == AstKind.ForStatement) then
+                            local hasInf = false
+                            visitNode(stmts[wIdx], function(n)
+                                if n ~= stmts[wIdx] and n.kind == AstKind.WhileStatement
+                                    and n.condition.kind == AstKind.BooleanExpression and n.condition.value == true then
+                                    hasInf = true
+                                end
+                            end)
+                            if sanityCellSc then
                                 for cIdx = wIdx - 1, math.max(1, wIdx - 20), -1 do
                                     local cs = stmts[cIdx]
-                                    if cs.kind == AstKind.AssignmentStatement and #cs.lhs == 1 and #cs.rhs == 1
+                                    local isCellDecl = (cs.kind == AstKind.AssignmentStatement and #cs.lhs == 1 and #cs.rhs == 1
                                         and cs.lhs[1].kind == AstKind.AssignmentVariable
                                         and cs.lhs[1].scope == sanityCellSc and cs.lhs[1].id == sanityCellId
-                                        and cs.rhs[1].kind == AstKind.TableConstructorExpression then
+                                        and cs.rhs[1].kind == AstKind.TableConstructorExpression)
+                                        or (cs.kind == AstKind.LocalVariableDeclaration and #cs.ids == 1 and cs.expressions and #cs.expressions == 1
+                                        and cs.scope == sanityCellSc and cs.ids[1] == sanityCellId
+                                        and cs.expressions[1].kind == AstKind.TableConstructorExpression)
+                                    if isCellDecl then
                                         startIdx = cIdx
-                                        if cIdx >= 2 then
-                                            local ps = stmts[cIdx - 1]
-                                            if ps.kind == AstKind.AssignmentStatement and #ps.lhs == 1 and #ps.rhs == 1
-                                                and ps.rhs[1].kind == AstKind.StringExpression then
-                                                startIdx = cIdx - 1
+                                        for pIdx = cIdx - 1, math.max(1, cIdx - 4), -1 do
+                                            local ps = stmts[pIdx]
+                                            if (ps.kind == AstKind.AssignmentStatement and #ps.lhs == 1 and #ps.rhs == 1
+                                                and ps.rhs[1].kind == AstKind.StringExpression)
+                                                or (ps.kind == AstKind.LocalVariableDeclaration and #ps.ids == 1 and ps.expressions and #ps.expressions == 1
+                                                and ps.expressions[1].kind == AstKind.StringExpression) then
+                                                startIdx = pIdx
+                                            elseif ps.kind == AstKind.LocalVariableDeclaration and (#(ps.expressions or {}) == 0) then
+                                                startIdx = pIdx
+                                            else
+                                                break
                                             end
                                         end
                                         break
                                     end
                                 end
+                            elseif hasInf then
+                                startIdx = wIdx
+                                for cIdx = wIdx - 1, math.max(1, wIdx - 12), -1 do
+                                    local cs = stmts[cIdx]
+                                    if cs.kind == AstKind.AssignmentStatement and #cs.lhs == 1 and #cs.rhs == 1
+                                        and cs.lhs[1].kind == AstKind.AssignmentVariable and not cs.lhs[1].scope.isGlobal then
+                                        startIdx = cIdx
+                                        if cs.rhs[1].kind == AstKind.StringExpression then break end
+                                    elseif cs.kind == AstKind.LocalVariableDeclaration and #cs.ids == 1 then
+                                        startIdx = cIdx
+                                        if cs.expressions and cs.expressions[1] and cs.expressions[1].kind == AstKind.StringExpression then
+                                            break
+                                        end
+                                    else
+                                        break
+                                    end
+                                end
                             end
                         end
-                    end
 
-                    local realBody = stmts[ifIdx].body.statements
-                    local newStmts = {}
-                    for k = 1, startIdx - 1 do
-                        newStmts[#newStmts + 1] = stmts[k]
+                        local toDrop = {}
+                        for k = startIdx, ifIdx - 1 do
+                            toDrop[stmts[k]] = true
+                        end
+                        toDrop[stmts[ifIdx]] = true
+                        local survivingRefs = {}
+                        visitast(ast, function(n)
+                            if toDrop[n] then return nil, true end
+                            if (n.kind == AstKind.VariableExpression or n.kind == AstKind.AssignmentVariable
+                                or n.kind == AstKind.FunctionDeclaration) and n.scope and not n.scope.isGlobal then
+                                survivingRefs[varKey(n.scope, n.id)] = true
+                            end
+                        end)
+                        for _, rb in ipairs(stmts[ifIdx].body.statements) do
+                            visitNode(rb, function(n)
+                                if (n.kind == AstKind.VariableExpression or n.kind == AstKind.AssignmentVariable
+                                    or n.kind == AstKind.FunctionDeclaration) and n.scope and not n.scope.isGlobal then
+                                    survivingRefs[varKey(n.scope, n.id)] = true
+                                end
+                            end, nil, ast.globalScope)
+                        end
+
+                        local realBody = stmts[ifIdx].body.statements
+                        local newStmts = {}
+                        for k = 1, startIdx - 1 do
+                            newStmts[#newStmts + 1] = stmts[k]
+                        end
+                        for k = startIdx, ifIdx - 1 do
+                            local dk = stmts[k]
+                            if dk.kind == AstKind.LocalVariableDeclaration then
+                                local keepIds = {}
+                                for _, id in ipairs(dk.ids) do
+                                    if survivingRefs[varKey(dk.scope, id)] then
+                                        keepIds[#keepIds + 1] = id
+                                    end
+                                end
+                                if #keepIds > 0 then
+                                    newStmts[#newStmts + 1] = Ast.LocalVariableDeclaration(dk.scope, keepIds, {})
+                                end
+                            end
+                        end
+                        for k = 1, #realBody do
+                            newStmts[#newStmts + 1] = realBody[k]
+                        end
+                        for k = ifIdx + 1, #stmts do
+                            newStmts[#newStmts + 1] = stmts[k]
+                        end
+                        node.statements = newStmts
+                        stmts = newStmts
+                        removed = true
+                        i = startIdx
+                    else
+                        i = i + 1
                     end
-                    for k = 1, #realBody do
-                        newStmts[#newStmts + 1] = realBody[k]
-                    end
-                    for k = ifIdx + 1, #stmts do
-                        newStmts[#newStmts + 1] = stmts[k]
-                    end
-                    node.statements = newStmts
-                    stmts = newStmts
-                    removed = true
-                    i = startIdx
                 else
                     i = i + 1
                 end
@@ -820,10 +1324,16 @@ function Passes.removeWatermarks(ast)
 end
 
 local function matchSplitStringsCustomVariant(fn)
-    if fn.kind ~= AstKind.FunctionLiteralExpression then return nil end
+    if fn.kind ~= AstKind.FunctionLiteralExpression and fn.kind ~= AstKind.LocalFunctionDeclaration then return nil end
     if effectiveArgCount(fn.args) ~= 1 or fn.args[1].kind ~= AstKind.VariableExpression then return nil end
     local tblScope, tblId = fn.args[1].scope, fn.args[1].id
-    local stmts = fn.body.statements
+    local stmts = {}
+    for i = 1, #fn.body.statements do
+        local s = fn.body.statements[i]
+        if not (i == #fn.body.statements and s.kind == AstKind.ReturnStatement and #s.args == 0) then
+            stmts[#stmts + 1] = s
+        end
+    end
     if #stmts ~= 3 then return nil end
     if stmts[1].kind ~= AstKind.LocalVariableDeclaration then return nil end
     if stmts[2].kind ~= AstKind.ForStatement then return nil end
@@ -925,10 +1435,33 @@ function Passes.unsplitStrings(ast)
     end)
 
     visitast(ast, function(node)
-        if node.kind == AstKind.LocalVariableDeclaration and #node.ids == 1 and #node.expressions == 1 then
+        if node.kind == AstKind.LocalFunctionDeclaration then
+            local k = varKey(node.scope, node.id)
+            if (writes[k] or 0) <= 1 then
+                local variant = matchSplitStringsCustomVariant(node)
+                if variant then
+                    customHelpers[k] = { variant = variant, decl = node }
+                end
+            end
+        elseif node.kind == AstKind.LocalVariableDeclaration and #node.ids == 1 and #node.expressions == 1 then
             local k = varKey(node.scope, node.ids[1])
             if (writes[k] or 0) == 1 then
                 local expr = node.expressions[1]
+                local variant = matchSplitStringsCustomVariant(expr)
+                if variant then
+                    customHelpers[k] = { variant = variant, decl = node }
+                elseif not tableGlobalWritten and expr.kind == AstKind.IndexExpression
+                    and expr.base.kind == AstKind.VariableExpression and expr.base.scope.isGlobal
+                    and expr.base.scope:getVariableName(expr.base.id) == "table"
+                    and expr.index.kind == AstKind.StringExpression and expr.index.value == "concat" then
+                    concatHelpers[k] = { decl = node }
+                end
+            end
+        elseif node.kind == AstKind.AssignmentStatement and #node.lhs == 1 and #node.rhs == 1
+            and node.lhs[1].kind == AstKind.AssignmentVariable and not node.lhs[1].scope.isGlobal then
+            local k = varKey(node.lhs[1].scope, node.lhs[1].id)
+            if (writes[k] or 0) == 1 then
+                local expr = node.rhs[1]
                 local variant = matchSplitStringsCustomVariant(expr)
                 if variant then
                     customHelpers[k] = { variant = variant, decl = node }
@@ -995,6 +1528,17 @@ function Passes.unsplitStrings(ast)
                     local removeStmt = false
                     if s.kind == AstKind.LocalVariableDeclaration and #s.ids == 1 then
                         local k = varKey(s.scope, s.ids[1])
+                        if (customHelpers[k] or concatHelpers[k]) and (postReads[k] or 0) == 0 then
+                            removeStmt = true
+                        end
+                    elseif s.kind == AstKind.LocalFunctionDeclaration then
+                        local k = varKey(s.scope, s.id)
+                        if customHelpers[k] and (postReads[k] or 0) == 0 then
+                            removeStmt = true
+                        end
+                    elseif s.kind == AstKind.AssignmentStatement and #s.lhs == 1
+                        and s.lhs[1].kind == AstKind.AssignmentVariable and not s.lhs[1].scope.isGlobal then
+                        local k = varKey(s.lhs[1].scope, s.lhs[1].id)
                         if (customHelpers[k] or concatHelpers[k]) and (postReads[k] or 0) == 0 then
                             removeStmt = true
                         end
@@ -1226,10 +1770,15 @@ local function matchDecodeDoStatement(stmt, arrScope, arrId)
 end
 
 local function matchLocalWrapperTable(stmt, wrapperScope, wrapperId)
-    if stmt.kind ~= AstKind.LocalVariableDeclaration or #stmt.ids ~= 1 or #stmt.expressions ~= 1 then
+    local lwScope, lwId, tbl
+    if stmt.kind == AstKind.LocalVariableDeclaration and #stmt.ids == 1 and stmt.expressions and #stmt.expressions == 1 then
+        lwScope, lwId, tbl = stmt.scope, stmt.ids[1], stmt.expressions[1]
+    elseif stmt.kind == AstKind.AssignmentStatement and #stmt.lhs == 1 and #stmt.rhs == 1
+        and stmt.lhs[1].kind == AstKind.AssignmentVariable and not stmt.lhs[1].scope.isGlobal then
+        lwScope, lwId, tbl = stmt.lhs[1].scope, stmt.lhs[1].id, stmt.rhs[1]
+    else
         return nil
     end
-    local tbl = stmt.expressions[1]
     if tbl.kind ~= AstKind.TableConstructorExpression or #tbl.entries == 0 then
         return nil
     end
@@ -1240,14 +1789,20 @@ local function matchLocalWrapperTable(stmt, wrapperScope, wrapperId)
             return nil
         end
         local fn = e.value
-        if fn.kind ~= AstKind.FunctionLiteralExpression or #fn.args < 1 or #fn.body.statements ~= 1 then
+        if fn.kind ~= AstKind.FunctionLiteralExpression or #fn.args < 1 then
             return nil
         end
-        local ret = fn.body.statements[1]
-        if ret.kind ~= AstKind.ReturnStatement or #ret.args ~= 1 then
+        local eff = {}
+        for k = 1, #fn.body.statements do
+            local s = fn.body.statements[k]
+            if not (k == #fn.body.statements and s.kind == AstKind.ReturnStatement and #s.args == 0) then
+                eff[#eff + 1] = s
+            end
+        end
+        if #eff ~= 1 or eff[1].kind ~= AstKind.ReturnStatement or #eff[1].args ~= 1 then
             return nil
         end
-        local call = ret.args[1]
+        local call = eff[1].args[1]
         if call.kind ~= AstKind.FunctionCallExpression or not isVarRef(call.base, wrapperScope, wrapperId) or #call.args ~= 1 then
             return nil
         end
@@ -1278,7 +1833,7 @@ local function matchLocalWrapperTable(stmt, wrapperScope, wrapperId)
         if not matchedArgPos then return nil end
         methods[e.key.value] = { argPos = matchedArgPos, delta = localDelta, argCount = #fn.args }
     end
-    return methods
+    return methods, lwScope, lwId
 end
 
 local function parseRotateRangesTable(outerTbl)
@@ -1417,16 +1972,36 @@ function Passes.resolveConstantArray(ast)
                     for idx = arrStmtIdx + 1, #stmts do
                         local st = stmts[idx]
                         local tblExpr
+                        local selfLoop = false
                         if st.kind == AstKind.LocalVariableDeclaration and #st.ids == 1 and #st.expressions == 1 then
                             tblExpr = st.expressions[1]
                         elseif st.kind == AstKind.AssignmentStatement and #st.lhs == 1 and #st.rhs == 1 then
                             tblExpr = st.rhs[1]
+                        elseif st.kind == AstKind.ForInStatement and #st.expressions == 1
+                            and st.expressions[1].kind == AstKind.FunctionCallExpression
+                            and #st.expressions[1].args == 1 then
+                            tblExpr = st.expressions[1].args[1]
+                            selfLoop = true
                         end
                         if tblExpr then
                             local rr = parseRotateRangesTable(tblExpr)
                             if rr and rr[1][2] == rawValues.len then
-                                for wIdx = idx + 1, math.min(#stmts, idx + 15) do
-                                    if stmts[wIdx].kind == AstKind.WhileStatement then
+                                if selfLoop then
+                                    local touchesArr = false
+                                    visitNode(st.body, function(n)
+                                        if (n.kind == AstKind.AssignmentIndexing and isVarRef(n.base, arrScope, arrId))
+                                            or isVarRef(n, arrScope, arrId) then
+                                            touchesArr = true
+                                        end
+                                    end)
+                                    if touchesArr then
+                                        rotateRanges = rr
+                                        rotateStmtIdx = idx
+                                        break
+                                    end
+                                end
+                                for wIdx = idx + 1, math.min(#stmts, idx + 80) do
+                                    if stmts[wIdx].kind == AstKind.WhileStatement or stmts[wIdx].kind == AstKind.ForStatement then
                                         local touchesArr = false
                                         visitNode(stmts[wIdx].body, function(n)
                                             if (n.kind == AstKind.AssignmentIndexing and isVarRef(n.base, arrScope, arrId))
@@ -1471,8 +2046,8 @@ function Passes.resolveConstantArray(ast)
 
                     if lookup64 or lookup85 then
                         local searchFrom = math.max(l64Idx or 0, l85Idx or 0) + 1
-                        for wIdx = searchFrom, math.min(#stmts, searchFrom + 20) do
-                            if stmts[wIdx].kind == AstKind.WhileStatement then
+                        for wIdx = searchFrom, math.min(#stmts, searchFrom + 80) do
+                            if stmts[wIdx].kind == AstKind.WhileStatement or stmts[wIdx].kind == AstKind.ForStatement then
                                 local touchesArr = false
                                 visitNode(stmts[wIdx].body, function(n)
                                     if n.kind == AstKind.AssignmentIndexing then
@@ -1568,17 +2143,20 @@ function Passes.resolveConstantArray(ast)
                     end
                 end
 
+                local subBlocks = { blockNode }
+                visitNode(blockNode, function(sb)
+                    if sb.kind == AstKind.Block and sb ~= blockNode then subBlocks[#subBlocks + 1] = sb end
+                end, nil, ast.globalScope)
+
                 local localWrappers = {}
-                visitNode(blockNode, function(subBlock)
-                    if subBlock.kind == AstKind.Block then
-                        for _, s in ipairs(subBlock.statements) do
-                            local methods = matchLocalWrapperTable(s, wrapperScope, wrapperId)
-                            if methods then
-                                localWrappers[varKey(s.scope, s.ids[1])] = { methods = methods, stmt = s }
-                            end
+                for _, subBlock in ipairs(subBlocks) do
+                    for _, s in ipairs(subBlock.statements) do
+                        local methods, lwSc, lwId = matchLocalWrapperTable(s, wrapperScope, wrapperId)
+                        if methods and lwSc then
+                            localWrappers[varKey(lwSc, lwId)] = { methods = methods, stmt = s }
                         end
                     end
-                end, nil, ast.globalScope)
+                end
 
                 local function lookupSlot(rawIndex)
                     if type(rawIndex) ~= "number" then return nil end
@@ -1622,20 +2200,52 @@ function Passes.resolveConstantArray(ast)
                     end
                 end, ast.globalScope)
 
-                local subBlocks = {}
-                visitNode(blockNode, function(sb)
-                    if sb.kind == AstKind.Block then subBlocks[#subBlocks + 1] = sb end
-                end, nil, ast.globalScope)
-
                 local postReadsAfterLw = countVarUsage(ast)
                 for _, subBlock in ipairs(subBlocks) do
                     local i = 1
                     while i <= #subBlock.statements do
                         local s = subBlock.statements[i]
+                        local k = nil
                         if s.kind == AstKind.LocalVariableDeclaration and #s.ids == 1 then
-                            local k = varKey(s.scope, s.ids[1])
-                            if localWrappers[k] and (postReadsAfterLw[k] or 0) == 0 then
-                                table.remove(subBlock.statements, i)
+                            k = varKey(s.scope, s.ids[1])
+                        elseif s.kind == AstKind.AssignmentStatement and #s.lhs == 1
+                            and s.lhs[1].kind == AstKind.AssignmentVariable and not s.lhs[1].scope.isGlobal then
+                            k = varKey(s.lhs[1].scope, s.lhs[1].id)
+                        end
+                        if k and localWrappers[k] and localWrappers[k].stmt == s then
+                            local liveReads = postReadsAfterLw[k] or 0
+                            if liveReads > 0 and subBlock == blockNode then
+                                local afterReads = 0
+                                for tailIdx = i + 1, #subBlock.statements do
+                                    visitNode(subBlock.statements[tailIdx], function(x)
+                                        if x.kind == AstKind.VariableExpression and varKey(x.scope, x.id) == k then
+                                            afterReads = afterReads + 1
+                                        end
+                                    end, nil, ast.globalScope)
+                                end
+                                liveReads = afterReads
+                            end
+                            if liveReads == 0 then
+                                if s.kind == AstKind.LocalVariableDeclaration then
+                                    local usedAfter = false
+                                    for tailIdx = i + 1, #subBlock.statements do
+                                        visitNode(subBlock.statements[tailIdx], function(x)
+                                            if (x.kind == AstKind.VariableExpression or x.kind == AstKind.AssignmentVariable
+                                                or x.kind == AstKind.FunctionDeclaration)
+                                                and varKey(x.scope, x.id) == k then
+                                                usedAfter = true
+                                            end
+                                        end, nil, ast.globalScope)
+                                    end
+                                    if usedAfter then
+                                        subBlock.statements[i] = Ast.LocalVariableDeclaration(s.scope, { s.ids[1] }, {})
+                                        i = i + 1
+                                    else
+                                        table.remove(subBlock.statements, i)
+                                    end
+                                else
+                                    table.remove(subBlock.statements, i)
+                                end
                                 anyChanged = true
                             else
                                 i = i + 1
@@ -1673,10 +2283,39 @@ function Passes.resolveConstantArray(ast)
                         toRemove[stmts[arrStmtIdx]] = true
                     end
 
+                    local survivingRefs = {}
+                    visitast(ast, function(n)
+                        if toRemove[n] then return nil, true end
+                        if (n.kind == AstKind.VariableExpression or n.kind == AstKind.AssignmentVariable
+                            or n.kind == AstKind.FunctionDeclaration) and n.scope and not n.scope.isGlobal then
+                            survivingRefs[varKey(n.scope, n.id)] = true
+                        end
+                    end)
+
                     local i = 1
                     while i <= #stmts do
-                        if toRemove[stmts[i]] then
-                            table.remove(stmts, i)
+                        local si = stmts[i]
+                        if toRemove[si] then
+                            if si.kind == AstKind.LocalVariableDeclaration then
+                                local keepIds = {}
+                                for _, id in ipairs(si.ids) do
+                                    if survivingRefs[varKey(si.scope, id)] then
+                                        keepIds[#keepIds + 1] = id
+                                    end
+                                end
+                                if #keepIds > 0 then
+                                    stmts[i] = Ast.LocalVariableDeclaration(si.scope, keepIds, {})
+                                    i = i + 1
+                                else
+                                    table.remove(stmts, i)
+                                end
+                            elseif si.kind == AstKind.LocalFunctionDeclaration
+                                and survivingRefs[varKey(si.scope, si.id)] then
+                                stmts[i] = Ast.LocalVariableDeclaration(si.scope, { si.id }, {})
+                                i = i + 1
+                            else
+                                table.remove(stmts, i)
+                            end
                             anyChanged = true
                         else
                             i = i + 1
@@ -1967,7 +2606,43 @@ local function unhoistVmStrings(ast)
 
     for _, blockNode in ipairs(blocks) do
         local dataTables = {}
+        local constStrDefs = {}
         for sIdx, s in ipairs(blockNode.statements) do
+            if s.kind == AstKind.LocalVariableDeclaration and s.expressions then
+                for i = 1, #s.ids do
+                    local lk = varKey(s.scope, s.ids[i])
+                    local ex = s.expressions[i]
+                    if ex and ex.kind == AstKind.StringExpression then
+                        constStrDefs[lk] = ex.value
+                    elseif ex and ex.kind == AstKind.VariableExpression then
+                        constStrDefs[lk] = constStrDefs[varKey(ex.scope, ex.id)]
+                    else
+                        constStrDefs[lk] = nil
+                    end
+                end
+            elseif s.kind == AstKind.AssignmentStatement then
+                for i = 1, #s.lhs do
+                    local l = s.lhs[i]
+                    local ex = s.rhs[i]
+                    if l.kind == AstKind.AssignmentVariable and not l.scope.isGlobal then
+                        local lk = varKey(l.scope, l.id)
+                        if ex and ex.kind == AstKind.StringExpression then
+                            constStrDefs[lk] = ex.value
+                        elseif ex and ex.kind == AstKind.VariableExpression then
+                            constStrDefs[lk] = constStrDefs[varKey(ex.scope, ex.id)]
+                        else
+                            constStrDefs[lk] = nil
+                        end
+                    end
+                end
+            elseif s.kind ~= AstKind.DoStatement then
+                visitNode(s, function(n)
+                    if n.kind == AstKind.AssignmentVariable and not n.scope.isGlobal then
+                        constStrDefs[varKey(n.scope, n.id)] = nil
+                    end
+                end, nil, ast.globalScope)
+            end
+
             local dtScope, dtId, dtTbl
             if s.kind == AstKind.LocalVariableDeclaration and #s.ids == 1 and #s.expressions == 1
                 and s.expressions[1].kind == AstKind.TableConstructorExpression then
@@ -1983,11 +2658,22 @@ local function unhoistVmStrings(ast)
                     local strs = {}
                     local ok = true
                     for i = 1, #entries do
-                        if entries[i].kind ~= AstKind.TableEntry or entries[i].value.kind ~= AstKind.StringExpression then
+                        if entries[i].kind ~= AstKind.TableEntry then
                             ok = false
                             break
                         end
-                        strs[i] = entries[i].value.value
+                        local ev = entries[i].value
+                        local sv = nil
+                        if ev.kind == AstKind.StringExpression then
+                            sv = ev.value
+                        elseif ev.kind == AstKind.VariableExpression then
+                            sv = constStrDefs[varKey(ev.scope, ev.id)]
+                        end
+                        if sv == nil then
+                            ok = false
+                            break
+                        end
+                        strs[i] = sv
                     end
                     if ok then
                         local k = varKey(dtScope, dtId)
@@ -2333,10 +3019,34 @@ local METATABLE_OP_KINDS = {
     __concat = AstKind.StrCatExpression,
 }
 
+local function isEmptyProxyFn(fn)
+    if not fn then return false end
+    if fn.kind ~= AstKind.FunctionLiteralExpression and fn.kind ~= AstKind.LocalFunctionDeclaration then
+        return false
+    end
+    if not (#fn.args == 0 or (#fn.args == 1 and fn.args[1].kind == AstKind.VarargExpression)) then
+        return false
+    end
+    local st = fn.body and fn.body.statements
+    if not st then return false end
+    if #st == 0 then return true end
+    if #st == 1 and st[1].kind == AstKind.ReturnStatement and #st[1].args == 0 then
+        return true
+    end
+    return false
+end
+
+local function isSetmetatableExpr(expr, setmtMap)
+    if not expr or expr.kind ~= AstKind.VariableExpression then return false end
+    if expr.scope.isGlobal and expr.scope:getVariableName(expr.id) == "setmetatable" then
+        return true
+    end
+    return setmtMap and setmtMap[varKey(expr.scope, expr.id)] ~= nil
+end
+
 local function matchProxyCall(expr, setmtMap)
     if expr.kind ~= AstKind.FunctionCallExpression or #expr.args ~= 2 then return nil end
-    if expr.base.kind ~= AstKind.VariableExpression then return nil end
-    if not setmtMap[varKey(expr.base.scope, expr.base.id)] then return nil end
+    if not isSetmetatableExpr(expr.base, setmtMap) then return nil end
     local valTbl, mtTbl = expr.args[1], expr.args[2]
     if valTbl.kind ~= AstKind.TableConstructorExpression or #valTbl.entries ~= 1 then return nil end
     if mtTbl.kind ~= AstKind.TableConstructorExpression or #mtTbl.entries ~= 2 then return nil end
@@ -2351,8 +3061,15 @@ local function matchProxyCall(expr, setmtMap)
         if me.kind ~= AstKind.KeyedTableEntry or me.key.kind ~= AstKind.StringExpression then return nil end
         local opKind = METATABLE_OP_KINDS[me.key.value]
         if not opKind or me.value.kind ~= AstKind.FunctionLiteralExpression or #me.value.args ~= 2 then return nil end
-        if #me.value.body.statements ~= 1 then return nil end
-        local s = me.value.body.statements[1]
+        local eff = {}
+        for k = 1, #me.value.body.statements do
+            local bs = me.value.body.statements[k]
+            if not (k == #me.value.body.statements and bs.kind == AstKind.ReturnStatement and #bs.args == 0) then
+                eff[#eff + 1] = bs
+            end
+        end
+        if #eff ~= 1 then return nil end
+        local s = eff[1]
         if s.kind == AstKind.AssignmentStatement then
             setKind = opKind
         elseif s.kind == AstKind.ReturnStatement then
@@ -2376,32 +3093,37 @@ function Passes.unproxifyLocals(ast)
     local emptyFnVars = {}
 
     visitast(ast, function(node)
-        if node.kind == AstKind.LocalVariableDeclaration and #node.ids == 1 and #node.expressions == 1 then
+        if node.kind == AstKind.LocalVariableDeclaration and #node.ids == 1 and node.expressions and #node.expressions == 1 then
             local k = varKey(node.scope, node.ids[1])
             if (writes[k] or 0) == 1 then
                 local e = node.expressions[1]
-                if e.kind == AstKind.VariableExpression and e.scope.isGlobal
-                    and e.scope:getVariableName(e.id) == "setmetatable" then
+                if isSetmetatableExpr(e, setmtVars) then
                     setmtVars[k] = node
-                elseif e.kind == AstKind.FunctionLiteralExpression and #e.body.statements == 0
-                    and (#e.args == 0 or (#e.args == 1 and e.args[1].kind == AstKind.VarargExpression)) then
+                elseif isEmptyProxyFn(e) then
                     emptyFnVars[k] = node
                 end
             end
-        elseif node.kind == AstKind.LocalFunctionDeclaration and #node.body.statements == 0
-            and (#node.args == 0 or (#node.args == 1 and node.args[1].kind == AstKind.VarargExpression)) then
-            local k = varKey(node.scope, node.id)
+        elseif node.kind == AstKind.AssignmentStatement and #node.lhs == 1 and #node.rhs == 1
+            and node.lhs[1].kind == AstKind.AssignmentVariable and not node.lhs[1].scope.isGlobal then
+            local k = varKey(node.lhs[1].scope, node.lhs[1].id)
             if (writes[k] or 0) == 1 then
+                local e = node.rhs[1]
+                if isSetmetatableExpr(e, setmtVars) then
+                    setmtVars[k] = node
+                elseif isEmptyProxyFn(e) then
+                    emptyFnVars[k] = node
+                end
+            end
+        elseif node.kind == AstKind.LocalFunctionDeclaration and isEmptyProxyFn(node) then
+            local k = varKey(node.scope, node.id)
+            if (writes[k] or 0) <= 1 then
                 emptyFnVars[k] = node
             end
         end
     end)
 
-    if next(setmtVars) == nil then
-        return false
-    end
-
     local proxies = {}
+    local deadProxyCallStmts = {}
     visitast(ast, function(node)
         if node.kind == AstKind.LocalVariableDeclaration and node.expressions and #node.expressions > 0 then
             for i = 1, #node.ids do
@@ -2411,22 +3133,46 @@ function Passes.unproxifyLocals(ast)
                     if info then
                         local k = varKey(node.scope, node.ids[i])
                         proxies[k] = info
-                        if info.initExpr.kind == AstKind.FunctionLiteralExpression
-                            and #info.initExpr.body.statements == 0
-                            and (#info.initExpr.args == 0 or (#info.initExpr.args == 1 and info.initExpr.args[1].kind == AstKind.VarargExpression)) then
+                        if isEmptyProxyFn(info.initExpr) then
                             emptyFnVars[k] = node
                         end
                     end
                 end
             end
+        elseif node.kind == AstKind.AssignmentStatement then
+            for i = 1, #node.lhs do
+                local lv = node.lhs[i]
+                local expr = node.rhs[i]
+                if lv.kind == AstKind.AssignmentVariable and not lv.scope.isGlobal and expr then
+                    local k = varKey(lv.scope, lv.id)
+                    if (writes[k] or 0) == 1 then
+                        local info = matchProxyCall(expr, setmtVars)
+                        if info then
+                            proxies[k] = info
+                            if isEmptyProxyFn(info.initExpr) then
+                                emptyFnVars[k] = node
+                            end
+                        end
+                    end
+                end
+            end
+        elseif node.kind == AstKind.FunctionCallStatement then
+            local pseudoCall = Ast.FunctionCallExpression(node.base, node.args)
+            local info = matchProxyCall(pseudoCall, setmtVars)
+            if info and isEmptyProxyFn(info.initExpr) then
+                deadProxyCallStmts[node] = true
+            end
         end
     end)
 
-    if next(proxies) == nil then
+    if next(proxies) == nil and next(deadProxyCallStmts) == nil then
         return false
     end
 
     local function isEmptyFnBase(baseExpr)
+        if isEmptyProxyFn(baseExpr) then
+            return true
+        end
         if baseExpr.kind == AstKind.VariableExpression then
             return emptyFnVars[varKey(baseExpr.scope, baseExpr.id)] ~= nil
         end
@@ -2489,7 +3235,12 @@ function Passes.unproxifyLocals(ast)
         if node.kind == AstKind.AssignmentStatement then
             for i = 1, #node.lhs do
                 local lhs = node.lhs[i]
-                if lhs.kind == AstKind.AssignmentIndexing and lhs.base.kind == AstKind.VariableExpression
+                if lhs.kind == AstKind.AssignmentVariable and not lhs.scope.isGlobal and node.rhs[i] then
+                    local info = proxies[varKey(lhs.scope, lhs.id)]
+                    if info and matchProxyCall(node.rhs[i], setmtVars) then
+                        node.rhs[i] = info.initExpr
+                    end
+                elseif lhs.kind == AstKind.AssignmentIndexing and lhs.base.kind == AstKind.VariableExpression
                     and lhs.index.kind == AstKind.StringExpression then
                     local info = proxies[varKey(lhs.base.scope, lhs.base.id)]
                     if info and lhs.index.value == info.valName then
@@ -2524,8 +3275,18 @@ function Passes.unproxifyLocals(ast)
             local i = 1
             while i <= #stmts do
                 local s = stmts[i]
-                if s.kind == AstKind.LocalVariableDeclaration and #s.ids == 1 then
+                if deadProxyCallStmts[s] then
+                    table.remove(stmts, i)
+                elseif s.kind == AstKind.LocalVariableDeclaration and #s.ids == 1 then
                     local k = varKey(s.scope, s.ids[1])
+                    if (setmtVars[k] or emptyFnVars[k]) and (postReads[k] or 0) == 0 then
+                        table.remove(stmts, i)
+                    else
+                        i = i + 1
+                    end
+                elseif s.kind == AstKind.AssignmentStatement and #s.lhs == 1
+                    and s.lhs[1].kind == AstKind.AssignmentVariable and not s.lhs[1].scope.isGlobal then
+                    local k = varKey(s.lhs[1].scope, s.lhs[1].id)
                     if (setmtVars[k] or emptyFnVars[k]) and (postReads[k] or 0) == 0 then
                         table.remove(stmts, i)
                     else
@@ -2556,9 +3317,12 @@ local FUNCTION_KINDS = lookupify({
 
 local function functionBodyUsesVararg(body)
     local uses = false
+    local seen = {}
     local function scan(node)
-        if type(node) ~= "table" then return end
+        if type(node) ~= "table" or seen[node] then return end
+        if node.variables and node.children then return end
         if FUNCTION_KINDS[node.kind] then return end
+        seen[node] = true
         if node.kind == AstKind.VarargExpression then
             uses = true
             return
@@ -2645,6 +3409,32 @@ function Passes.simplifyCells(ast)
         end
     end)
 
+    local unpassedIifeParams = {}
+    visitast(ast, function(n)
+        if n.kind == AstKind.FunctionCallExpression
+            and n.base.kind == AstKind.FunctionLiteralExpression then
+            local fn = n.base
+            local nArgs = #n.args
+            local lastArg = nArgs > 0 and n.args[nArgs] or nil
+            local lastMulti = lastArg and (
+                lastArg.kind == AstKind.FunctionCallExpression
+                or lastArg.kind == AstKind.PassSelfFunctionCallExpression
+                or lastArg.kind == AstKind.VarargExpression
+            )
+            if not lastMulti then
+                for pIdx = nArgs + 1, #fn.args do
+                    local pa = fn.args[pIdx]
+                    if pa.kind == AstKind.VariableExpression then
+                        local pk = varKey(pa.scope, pa.id)
+                        if (allWrites[pk] or 0) == 0 then
+                            unpassedIifeParams[pk] = true
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
     local blocks = {}
     visitast(ast, function(n)
         if n.kind == AstKind.Block then blocks[#blocks + 1] = n end
@@ -2719,6 +3509,9 @@ function Passes.simplifyCells(ast)
 
                 if not invalidCell then
                     local curNil = {}
+                    for pk in pairs(unpassedIifeParams) do
+                        curNil[pk] = true
+                    end
                     for m = 1, idx do
                         local sm = stmts[m]
                         if sm.kind == AstKind.AssignmentStatement and #sm.lhs == 1 and #sm.rhs == 1
@@ -2836,6 +3629,29 @@ function Passes.simplifyCells(ast)
 
                 if not invalidCell and next(snapSet) ~= nil then
                     local allowedSnapRefs = {}
+                    local grew = true
+                    while grew and not invalidCell do
+                        grew = false
+                        visitNode(blockNode, function(n)
+                            if n.kind == AstKind.LocalVariableDeclaration and #n.ids == 1 and #n.expressions == 1
+                                and n.expressions[1].kind == AstKind.VariableExpression
+                                and snapSet[varKey(n.expressions[1].scope, n.expressions[1].id)] then
+                                local skey = varKey(n.scope, n.ids[1])
+                                if not snapSet[skey] then
+                                    if (allWrites[skey] or 0) == 1 then
+                                        snapDecls[#snapDecls + 1] = n
+                                        snapSet[skey] = { scope = n.scope, id = n.ids[1] }
+                                        allowedSnapRefs[n.expressions[1]] = true
+                                        grew = true
+                                    else
+                                        invalidCell = true
+                                    end
+                                else
+                                    allowedSnapRefs[n.expressions[1]] = true
+                                end
+                            end
+                        end, nil, ast.globalScope)
+                    end
                     visitNode(blockNode, function(n)
                         if n.kind == AstKind.AssignmentIndexing and n.base.kind == AstKind.VariableExpression then
                             if snapSet[varKey(n.base.scope, n.base.id)] then
@@ -2864,7 +3680,54 @@ function Passes.simplifyCells(ast)
                     end
                 end
 
-                if not invalidCell and slotValWriteIdx and totalSlotReads > 0 then
+                if not invalidCell and totalSlotReads == 0
+                    and (slotValWriteIdx ~= nil or next(slotNilWriteIdxs) ~= nil or next(snapSet) ~= nil) then
+                    local valHasCall = false
+                    if slotValWriteIdx then
+                        visitNode(stmts[slotValWriteIdx].rhs[1], function(n)
+                            if n.kind == AstKind.FunctionLiteralExpression then return nil, true end
+                            if n.kind == AstKind.FunctionCallExpression or n.kind == AstKind.PassSelfFunctionCallExpression then
+                                valHasCall = true
+                            end
+                        end, nil, ast.globalScope)
+                    end
+                    if not valHasCall then
+                        if isLocalDecl then
+                            stmts[idx] = Ast.LocalVariableDeclaration(cellSc, { cellId }, {})
+                        else
+                            stmts[idx] = Ast.AssignmentStatement(
+                                { Ast.AssignmentVariable(cellSc, cellId) },
+                                { Ast.NilExpression() }
+                            )
+                        end
+                        for k = rangeEnd, idx + 1, -1 do
+                            if slotNilWriteIdxs[k] or k == slotValWriteIdx then
+                                table.remove(stmts, k)
+                            end
+                        end
+                        if next(snapSet) ~= nil then
+                            local snapDeclLookup = {}
+                            for _, sd in ipairs(snapDecls) do snapDeclLookup[sd] = true end
+                            local subBlocks = { blockNode }
+                            visitNode(blockNode, function(subB)
+                                if subB.kind == AstKind.Block and subB ~= blockNode then
+                                    subBlocks[#subBlocks + 1] = subB
+                                end
+                            end, nil, ast.globalScope)
+                            for _, subB in ipairs(subBlocks) do
+                                local j = 1
+                                while j <= #subB.statements do
+                                    if snapDeclLookup[subB.statements[j]] then
+                                        table.remove(subB.statements, j)
+                                    else
+                                        j = j + 1
+                                    end
+                                end
+                            end
+                        end
+                        anyChanged = true
+                    end
+                elseif not invalidCell and slotValWriteIdx and totalSlotReads > 0 then
                     local freshId = blockNode.scope:addVariable()
                     newLocalIds[#newLocalIds + 1] = freshId
 
@@ -2906,9 +3769,9 @@ function Passes.simplifyCells(ast)
                     end
 
                     if next(snapSet) ~= nil then
-                        local subBlocks = {}
+                        local subBlocks = { blockNode }
                         visitNode(blockNode, function(subB)
-                            if subB.kind == AstKind.Block then
+                            if subB.kind == AstKind.Block and subB ~= blockNode then
                                 subBlocks[#subBlocks + 1] = subB
                             end
                         end, function(n)
@@ -3299,27 +4162,48 @@ local function reconstructCffLoopsInBlock(blockNode, capturedRead, tonumberVars,
     local stmts = blockNode.statements
     local changed = false
 
-    local function matchForCoerceExpr(stmt, expectedSubstr)
-        if not stmt or stmt.kind ~= AstKind.AssignmentStatement or #stmt.lhs ~= 1 or #stmt.rhs ~= 1 then
-            return nil, nil
+    local function singleAssignOrDecl(stmt)
+        if not stmt then return nil, nil end
+        if stmt.kind == AstKind.AssignmentStatement and #stmt.lhs == 1 and #stmt.rhs == 1
+            and stmt.lhs[1].kind == AstKind.AssignmentVariable and not stmt.lhs[1].scope.isGlobal then
+            return stmt.lhs[1], stmt.rhs[1]
+        elseif stmt.kind == AstKind.LocalVariableDeclaration and #stmt.ids == 1
+            and stmt.expressions and #stmt.expressions == 1 then
+            return { scope = stmt.scope, id = stmt.ids[1] }, stmt.expressions[1]
         end
-        if stmt.lhs[1].kind ~= AstKind.AssignmentVariable or stmt.lhs[1].scope.isGlobal then
-            return nil, nil
-        end
-        local rhs = stmt.rhs[1]
-        if rhs.kind ~= AstKind.OrExpression then return nil, nil end
-        local c1, c2 = rhs.lhs, rhs.rhs
-        if c1.kind ~= AstKind.FunctionCallExpression or #c1.args ~= 1 then return nil, nil end
-        if c2.kind ~= AstKind.FunctionCallExpression or #c2.args ~= 1 then return nil, nil end
+        return nil, nil
+    end
+
+    local function isTonumberCall(c1)
+        if not c1 or c1.kind ~= AstKind.FunctionCallExpression or #c1.args ~= 1 then return false end
+        return isGlobalVar(c1.base, "tonumber")
+            or (c1.base.kind == AstKind.VariableExpression and tonumberVars[varKey(c1.base.scope, c1.base.id)] == true)
+    end
+
+    local function isErrorCallWith(c2, expectedSubstr)
+        if not c2 or c2.kind ~= AstKind.FunctionCallExpression or #c2.args < 1 then return false end
         if c2.args[1].kind ~= AstKind.StringExpression or not string.find(c2.args[1].value, expectedSubstr, 1, true) then
-            return nil, nil
+            return false
         end
-        local isTn = isGlobalVar(c1.base, "tonumber")
-            or (c1.base.kind == AstKind.VariableExpression and tonumberVars[varKey(c1.base.scope, c1.base.id)])
-        local isErr = isGlobalVar(c2.base, "error")
-            or (c2.base.kind == AstKind.VariableExpression and errorVars[varKey(c2.base.scope, c2.base.id)])
-        if not isTn or not isErr then return nil, nil end
-        return stmt.lhs[1], c1.args[1]
+        return isGlobalVar(c2.base, "error")
+            or (c2.base.kind == AstKind.VariableExpression and errorVars[varKey(c2.base.scope, c2.base.id)] == true)
+    end
+
+    local function matchForCoerceSeq(pos, expectedSubstr)
+        local lhs1, rhs1 = singleAssignOrDecl(stmts[pos])
+        if not lhs1 or not rhs1 then return nil end
+        if rhs1.kind == AstKind.OrExpression and isTonumberCall(rhs1.lhs) and isErrorCallWith(rhs1.rhs, expectedSubstr) then
+            return lhs1, rhs1.lhs.args[1], pos + 1, nil
+        end
+        if isTonumberCall(rhs1) and pos + 1 <= #stmts then
+            local lhs2, rhs2 = singleAssignOrDecl(stmts[pos + 1])
+            if lhs2 and rhs2 and rhs2.kind == AstKind.OrExpression
+                and isVarRef(rhs2.lhs, lhs1.scope, lhs1.id)
+                and isErrorCallWith(rhs2.rhs, expectedSubstr) then
+                return lhs2, rhs1.args[1], pos + 2, lhs1
+            end
+        end
+        return nil
     end
 
     local function varReferencedAfter(sc, id, startIdx)
@@ -3347,35 +4231,42 @@ local function reconstructCffLoopsInBlock(blockNode, capturedRead, tonumberVars,
     local i = 1
     while i <= #stmts do
         local matched = false
-        local initV, startExpr = matchForCoerceExpr(stmts[i], "initial value must be a number")
-        if initV and i + 5 <= #stmts then
-            local limitV, limitExpr = matchForCoerceExpr(stmts[i + 1], "limit must be a number")
-            local stepV, stepExpr = matchForCoerceExpr(stmts[i + 2], "step must be a number")
-            local negSt = stmts[i + 3]
-            local subSt = stmts[i + 4]
-            if limitV and stepV and negSt and subSt
-                and negSt.kind == AstKind.AssignmentStatement and #negSt.lhs == 1 and #negSt.rhs == 1
-                and negSt.lhs[1].kind == AstKind.AssignmentVariable and not negSt.lhs[1].scope.isGlobal
-                and subSt.kind == AstKind.AssignmentStatement and #subSt.lhs == 1 and #subSt.rhs == 1
-                and subSt.lhs[1].kind == AstKind.AssignmentVariable and not subSt.lhs[1].scope.isGlobal
-                and subSt.rhs[1].kind == AstKind.SubExpression
-                and isVarRef(subSt.rhs[1].lhs, initV.scope, initV.id)
-                and isVarRef(subSt.rhs[1].rhs, stepV.scope, stepV.id) then
-                local negV = negSt.lhs[1]
-                local idxV = subSt.lhs[1]
-                local negOk = (negSt.rhs[1].kind == AstKind.GreaterThanExpression
-                        and negSt.rhs[1].lhs.kind == AstKind.NumberExpression and negSt.rhs[1].lhs.value == 0
-                        and isVarRef(negSt.rhs[1].rhs, stepV.scope, stepV.id))
-                    or (negSt.rhs[1].kind == AstKind.LessThanExpression
-                        and isVarRef(negSt.rhs[1].lhs, stepV.scope, stepV.id)
-                        and negSt.rhs[1].rhs.kind == AstKind.NumberExpression and negSt.rhs[1].rhs.value == 0)
-                local wPos = i + 5
+        local initV, startExpr, p1, tmp1 = matchForCoerceSeq(i, "initial value must be a number")
+        if initV and p1 and p1 + 4 <= #stmts then
+            local limitV, limitExpr, p2, tmp2 = matchForCoerceSeq(p1, "limit must be a number")
+            local stepV, stepExpr, p3, tmp3 = nil, nil, nil, nil
+            if limitV and p2 then
+                stepV, stepExpr, p3, tmp3 = matchForCoerceSeq(p2, "step must be a number")
+            end
+            local negV, negRhs = nil, nil
+            local idxV, subRhs = nil, nil
+            if stepV and p3 and p3 + 2 <= #stmts then
+                negV, negRhs = singleAssignOrDecl(stmts[p3])
+                idxV, subRhs = singleAssignOrDecl(stmts[p3 + 1])
+            end
+            if limitV and stepV and negV and idxV and negRhs and subRhs
+                and subRhs.kind == AstKind.SubExpression
+                and isVarRef(subRhs.lhs, initV.scope, initV.id)
+                and isVarRef(subRhs.rhs, stepV.scope, stepV.id) then
+                local negOk = (negRhs.kind == AstKind.GreaterThanExpression
+                        and negRhs.lhs.kind == AstKind.NumberExpression and negRhs.lhs.value == 0
+                        and isVarRef(negRhs.rhs, stepV.scope, stepV.id))
+                    or (negRhs.kind == AstKind.LessThanExpression
+                        and isVarRef(negRhs.lhs, stepV.scope, stepV.id)
+                        and negRhs.rhs.kind == AstKind.NumberExpression and negRhs.rhs.value == 0)
+                local wPos = p3 + 2
                 if wPos <= #stmts and isNilAssignStmt(stmts[wPos])
                     and isSameVar(stmts[wPos].lhs[1], initV.scope, initV.id) then
                     wPos = wPos + 1
                 end
                 local ws = stmts[wPos]
-                if negOk and ws and ws.kind == AstKind.WhileStatement
+                local tmpsOk = true
+                for _, tv in ipairs({ tmp1, tmp2, tmp3 }) do
+                    if tv and (capturedRead[varKey(tv.scope, tv.id)] or varReferencedAfter(tv.scope, tv.id, wPos)) then
+                        tmpsOk = false
+                    end
+                end
+                if tmpsOk and negOk and ws and ws.kind == AstKind.WhileStatement
                     and ws.condition.kind == AstKind.BooleanExpression and ws.condition.value == true
                     and not capturedRead[varKey(initV.scope, initV.id)]
                     and not capturedRead[varKey(limitV.scope, limitV.id)]
@@ -3615,13 +4506,15 @@ local function reconstructCffLoopsInBlock(blockNode, capturedRead, tonumberVars,
                                     [varKey(fV.scope, fV.id)] = true,
                                     [varKey(sV.scope, sV.id)] = true,
                                 }
-                                if not lhsKeyLookup[varKey(tV.scope, tV.id)] then
-                                    fsKeys[varKey(tV.scope, tV.id)] = true
-                                end
+                                local checkTvReads = not lhsKeyLookup[varKey(tV.scope, tV.id)]
                                 for _, bs in ipairs(bodyRest) do
                                     visitNode(bs, function(n)
                                         if (n.kind == AstKind.VariableExpression or n.kind == AstKind.AssignmentVariable)
                                             and not n.scope.isGlobal and fsKeys[varKey(n.scope, n.id)] then
+                                            unsafe = true
+                                        end
+                                        if checkTvReads and n.kind == AstKind.VariableExpression
+                                            and isSameVar(n, tV.scope, tV.id) then
                                             unsafe = true
                                         end
                                         if n.kind == AstKind.AssignmentVariable and isSameVar(n, varV.scope, varV.id) then
@@ -3630,6 +4523,33 @@ local function reconstructCffLoopsInBlock(blockNode, capturedRead, tonumberVars,
                                     end, nil, globalScope)
                                 end
                                 if not unsafe then
+                                    if checkTvReads then
+                                        local function stripDeadTvNils(bNode)
+                                            local bSt = bNode.statements
+                                            local bi = 1
+                                            while bi <= #bSt do
+                                                local curS = bSt[bi]
+                                                if isNilAssignStmt(curS) and isSameVar(curS.lhs[1], tV.scope, tV.id) then
+                                                    table.remove(bSt, bi)
+                                                else
+                                                    if curS.body and curS.body.statements then
+                                                        stripDeadTvNils(curS.body)
+                                                    end
+                                                    if curS.elseifs then
+                                                        for _, eif in ipairs(curS.elseifs) do
+                                                            if eif.body then stripDeadTvNils(eif.body) end
+                                                        end
+                                                    end
+                                                    if curS.elsebody and curS.elsebody.statements then
+                                                        stripDeadTvNils(curS.elsebody)
+                                                    end
+                                                    bi = bi + 1
+                                                end
+                                            end
+                                        end
+                                        local tmpHolder = { statements = bodyRest }
+                                        stripDeadTvNils(tmpHolder)
+                                    end
                                     local lhsKeyMap = {}
                                     local forScope = Scope:new(blockNode.scope)
                                     local loopIds = {}
@@ -4096,9 +5016,126 @@ function Passes.resynthesizeLogic(ast)
                 end
             end
 
+            local function isPureDeadRhs(ex)
+                if not ex then return true end
+                if ex.kind == AstKind.NilExpression
+                    or ex.kind == AstKind.BooleanExpression
+                    or ex.kind == AstKind.NumberExpression
+                    or ex.kind == AstKind.StringExpression
+                    or ex.kind == AstKind.VariableExpression
+                    or ex.kind == AstKind.FunctionLiteralExpression
+                    or ex.kind == AstKind.VarargExpression then
+                    return true
+                end
+                if ex.kind == AstKind.IndexExpression
+                    and ex.base.kind == AstKind.VariableExpression
+                    and ex.base.scope.isGlobal
+                    and ex.index.kind == AstKind.StringExpression then
+                    local gName = ex.base.scope:getVariableName(ex.base.id)
+                    if gName == "math" or gName == "string" or gName == "table" or gName == "bit32" then
+                        return true
+                    end
+                end
+                if ex.kind == AstKind.OrExpression or ex.kind == AstKind.AndExpression then
+                    return isPureDeadRhs(ex.lhs) and isPureDeadRhs(ex.rhs)
+                end
+                if ex.kind == AstKind.TableConstructorExpression then
+                    if hasWeakMode then
+                        return false
+                    end
+                    for _, ent in ipairs(ex.entries) do
+                        if ent.kind == AstKind.KeyedTableEntry then
+                            if not isPureDeadRhs(ent.key) or not isPureDeadRhs(ent.value) then return false end
+                        else
+                            if ent.value.kind == AstKind.FunctionCallExpression
+                                and ex.entries[1] ~= ent
+                                and ent.value.base.kind == AstKind.VariableExpression
+                                and ent.value.base.scope.isGlobal
+                                and ent.value.base.scope:getVariableName(ent.value.base.id) == "select" then
+                            elseif not isPureDeadRhs(ent.value) then
+                                return false
+                            end
+                        end
+                    end
+                    return true
+                end
+                if ex.kind == AstKind.FunctionCallExpression
+                    and ex.base.kind == AstKind.VariableExpression then
+                    local fnName = ex.base.scope.isGlobal and ex.base.scope:getVariableName(ex.base.id) or nil
+                    if fnName == "select" and #ex.args >= 1
+                        and ex.args[1].kind == AstKind.StringExpression and ex.args[1].value == "#" then
+                        for a = 2, #ex.args do
+                            if not isPureDeadRhs(ex.args[a]) then return false end
+                        end
+                        return true
+                    elseif fnName == "getfenv" and (#ex.args == 0
+                        or (#ex.args == 1 and ex.args[1].kind == AstKind.NumberExpression
+                            and (ex.args[1].value == 0 or ex.args[1].value == 1))) then
+                        return true
+                    end
+                end
+                return false
+            end
+
+            local safeNumVars = {}
+            visitast(ast, function(fn)
+                if fn.kind == AstKind.ForStatement
+                    and fn.initialValue.kind == AstKind.NumberExpression
+                    and fn.initialValue.value == fn.initialValue.value
+                    and fn.finalValue.kind == AstKind.NumberExpression
+                    and fn.finalValue.value == fn.finalValue.value
+                    and (not fn.incrementBy or (fn.incrementBy.kind == AstKind.NumberExpression and fn.incrementBy.value == fn.incrementBy.value)) then
+                    safeNumVars[varKey(fn.scope, fn.id)] = true
+                elseif fn.kind == AstKind.AssignmentStatement and #fn.lhs == 1 and #fn.rhs == 1
+                    and fn.lhs[1].kind == AstKind.AssignmentVariable
+                    and fn.rhs[1].kind == AstKind.VariableExpression
+                    and safeNumVars[varKey(fn.rhs[1].scope, fn.rhs[1].id)]
+                    and (writes[varKey(fn.lhs[1].scope, fn.lhs[1].id)] or 0) == 1 then
+                    safeNumVars[varKey(fn.lhs[1].scope, fn.lhs[1].id)] = true
+                end
+            end)
+
+            local function isSafeTableKey(kx)
+                if not kx then return false end
+                if kx.kind == AstKind.StringExpression or kx.kind == AstKind.BooleanExpression then
+                    return true
+                end
+                if kx.kind == AstKind.NumberExpression then
+                    return kx.value == kx.value
+                end
+                if kx.kind == AstKind.VariableExpression and not kx.scope.isGlobal then
+                    return safeNumVars[varKey(kx.scope, kx.id)] == true
+                end
+                return false
+            end
+
             for idx = #stmts, 1, -1 do
                 local s = stmts[idx]
-                if s.kind == AstKind.AssignmentStatement and #s.lhs == 1 and #s.rhs == 1
+                if s.kind == AstKind.DoStatement and s.body and #s.body.statements == 0 then
+                    if s.body.scope and s.body.scope.parentScope then
+                        s.body.scope.parentScope:removeChild(s.body.scope)
+                    end
+                    table.remove(stmts, idx)
+                    roundChanged = true
+                elseif s.kind == AstKind.AssignmentStatement and #s.lhs == 1 and #s.rhs == 1
+                    and s.lhs[1].kind == AstKind.AssignmentIndexing
+                    and s.lhs[1].base.kind == AstKind.TableConstructorExpression
+                    and not hasWeakMode
+                    and isPureDeadRhs(s.lhs[1].base)
+                    and isSafeTableKey(s.lhs[1].index)
+                    and isPureDeadRhs(s.rhs[1]) then
+                    table.remove(stmts, idx)
+                    roundChanged = true
+                elseif s.kind == AstKind.ForStatement and s.body and #s.body.statements == 0
+                    and s.initialValue.kind == AstKind.NumberExpression
+                    and s.finalValue.kind == AstKind.NumberExpression
+                    and (not s.incrementBy or s.incrementBy.kind == AstKind.NumberExpression) then
+                    if s.body.scope and s.body.scope.parentScope then
+                        s.body.scope.parentScope:removeChild(s.body.scope)
+                    end
+                    table.remove(stmts, idx)
+                    roundChanged = true
+                elseif s.kind == AstKind.AssignmentStatement and #s.lhs == 1 and #s.rhs == 1
                     and s.lhs[1].kind == AstKind.AssignmentVariable and not s.lhs[1].scope.isGlobal then
                     local vSc, vId = s.lhs[1].scope, s.lhs[1].id
                     local vk = varKey(vSc, vId)
@@ -4107,6 +5144,9 @@ function Passes.resynthesizeLogic(ast)
                             and s.rhs[1].entries[1].kind == AstKind.TableEntry
                             and s.rhs[1].entries[1].value.kind == AstKind.VarargExpression
                             and (reads[vk] or 0) == 0 then
+                            table.remove(stmts, idx)
+                            roundChanged = true
+                        elseif (reads[vk] or 0) == 0 and not hasWeakMode and isPureDeadRhs(s.rhs[1]) then
                             table.remove(stmts, idx)
                             roundChanged = true
                         elseif s.rhs[1].kind == AstKind.NilExpression then
@@ -4146,38 +5186,105 @@ function Passes.resynthesizeLogic(ast)
                         end
                     end
                 elseif s.kind == AstKind.LocalVariableDeclaration then
-                    local allUnused = true
-                    for _, id in ipairs(s.ids) do
-                        local ik = varKey(s.scope, id)
-                        if (reads[ik] or 0) > 0 or (writes[ik] or 0) > 1 or capturedRead[ik] then
-                            allUnused = false
-                            break
-                        end
-                    end
-                    if allUnused then
-                        local pureRhs = true
-                        if s.expressions then
-                            for _, ex in ipairs(s.expressions) do
-                                local okEx = ex.kind == AstKind.NilExpression
-                                    or ex.kind == AstKind.BooleanExpression
-                                    or ex.kind == AstKind.NumberExpression
-                                    or ex.kind == AstKind.StringExpression
-                                    or ex.kind == AstKind.VariableExpression
-                                    or ex.kind == AstKind.FunctionLiteralExpression
-                                    or (ex.kind == AstKind.OrExpression
-                                        and ex.lhs.kind == AstKind.VariableExpression
-                                        and ex.rhs.kind == AstKind.IndexExpression
-                                        and ex.rhs.base.kind == AstKind.VariableExpression)
-                                    or (not hasWeakMode and ex.kind == AstKind.TableConstructorExpression and #ex.entries == 0)
-                                    or (ex.kind == AstKind.TableConstructorExpression and #ex.entries == 1
-                                        and ex.entries[1].kind == AstKind.TableEntry
-                                        and ex.entries[1].value.kind == AstKind.VarargExpression)
-                                if not okEx then pureRhs = false break end
+                    if not hasWeakMode and #s.ids == 1 and s.expressions and #s.expressions == 1
+                        and s.expressions[1].kind == AstKind.TableConstructorExpression
+                        and #s.expressions[1].entries == 0
+                        and not capturedRead[varKey(s.scope, s.ids[1])]
+                        and (writes[varKey(s.scope, s.ids[1])] or 0) == 1 then
+                        local tSc, tId = s.scope, s.ids[1]
+                        local writeOnlyPure = true
+                        local writeNodes = {}
+                        visitast(ast, function(n)
+                            if not writeOnlyPure or n == s then return nil, true end
+                            if n.kind == AstKind.AssignmentStatement then
+                                local matchedSelf = false
+                                for li = 1, #n.lhs do
+                                    local l = n.lhs[li]
+                                    if l.kind == AstKind.AssignmentIndexing and isVarRef(l.base, tSc, tId) then
+                                        local r = n.rhs[li]
+                                        if #n.lhs == 1 and #n.rhs == 1 and isSafeTableKey(l.index) and isPureDeadRhs(r)
+                                            and not isVarRef(l.index, tSc, tId) and not isVarRef(r, tSc, tId) then
+                                            writeNodes[n] = true
+                                            matchedSelf = true
+                                        else
+                                            writeOnlyPure = false
+                                        end
+                                    end
+                                end
+                                if matchedSelf then return nil, true end
+                            elseif n.kind == AstKind.VariableExpression and isVarRef(n, tSc, tId) then
+                                writeOnlyPure = false
+                            end
+                        end)
+                        if writeOnlyPure then
+                            local checkTop = true
+                            visitast(ast, function(n)
+                                if not checkTop or n == s or writeNodes[n] then return nil, true end
+                                if isVarRef(n, tSc, tId) then checkTop = false end
+                            end)
+                            if checkTop and next(writeNodes) ~= nil then
+                                visitast(ast, function(b)
+                                    if b.kind ~= AstKind.Block then return end
+                                    for bi = #b.statements, 1, -1 do
+                                        if writeNodes[b.statements[bi]] then
+                                            table.remove(b.statements, bi)
+                                        end
+                                    end
+                                end)
+                                table.remove(stmts, idx)
+                                reads, writes = countVarUsage(ast)
+                                roundChanged = true
                             end
                         end
-                        if pureRhs then
-                            table.remove(stmts, idx)
-                            roundChanged = true
+                    end
+                    if stmts[idx] == s then
+                        local allUnused = true
+                        for idxId, id in ipairs(s.ids) do
+                            local ik = varKey(s.scope, id)
+                            local ownWrites = (s.expressions and s.expressions[idxId] ~= nil) and 1 or 0
+                            if (reads[ik] or 0) > 0 or (writes[ik] or 0) > ownWrites or capturedRead[ik] then
+                                allUnused = false
+                                break
+                            end
+                        end
+                        if allUnused then
+                            local pureRhs = true
+                            if s.expressions then
+                                for _, ex in ipairs(s.expressions) do
+                                    if not isPureDeadRhs(ex) then pureRhs = false break end
+                                end
+                            end
+                            if pureRhs then
+                                table.remove(stmts, idx)
+                                roundChanged = true
+                            end
+                        elseif #s.ids == 1 and s.expressions and #s.expressions == 1
+                            and not capturedRead[varKey(s.scope, s.ids[1])]
+                            and isPureDeadRhs(s.expressions[1]) then
+                            local dSc, dId = s.scope, s.ids[1]
+                            local overwrittenFirst = false
+                            for j = idx + 1, #stmts do
+                                local sj = stmts[j]
+                                if sj.kind == AstKind.AssignmentStatement and #sj.lhs == 1 and #sj.rhs == 1
+                                    and isSameVar(sj.lhs[1], dSc, dId) then
+                                    local rRead = false
+                                    visitNode(sj.rhs[1], function(m)
+                                        if isVarRef(m, dSc, dId) then rRead = true end
+                                    end, nil, ast.globalScope)
+                                    overwrittenFirst = not rRead
+                                    break
+                                end
+                                local touched = false
+                                visitNode(sj, function(m)
+                                    if isSameVar(m, dSc, dId) then touched = true end
+                                end, nil, ast.globalScope)
+                                if touched then break end
+                            end
+                            if overwrittenFirst then
+                                s.expressions = {}
+                                writes = select(2, countVarUsage(ast))
+                                roundChanged = true
+                            end
                         end
                     end
                 elseif s.kind == AstKind.LocalFunctionDeclaration then
@@ -4323,12 +5430,36 @@ function Passes.resynthesizeLogic(ast)
                 if resSc and not nilHitRes and s2 and not capturedRead[varKey(resSc, resId)]
                     and s2.kind == AstKind.IfStatement and #s2.elseifs == 0
                     and (not s2.elsebody or #s2.elsebody.statements == 0)
-                    and #s2.body.statements == 1 then
-                    local innerS = s2.body.statements[1]
-                    if innerS.kind == AstKind.AssignmentStatement and #innerS.lhs == 1 and #innerS.rhs == 1
-                        and isSameVar(innerS.lhs[1], resSc, resId) then
+                    and #s2.body.statements >= 1 then
+                    local innerS = nil
+                    local bodyAllValid = true
+                    for bi = 1, #s2.body.statements do
+                        local bs = s2.body.statements[bi]
+                        if isNilAssignStmt(bs) and not isSameVar(bs.lhs[1], resSc, resId) then
+                            if hasWeakMode then bodyAllValid = false break end
+                        elseif not innerS and bs.kind == AstKind.AssignmentStatement
+                            and #bs.lhs == 1 and #bs.rhs == 1 and isSameVar(bs.lhs[1], resSc, resId) then
+                            innerS = bs
+                        else
+                            bodyAllValid = false
+                            break
+                        end
+                    end
+                    if bodyAllValid and innerS then
+                        local lhsVarOk = lhsExpr and lhsExpr.kind == AstKind.VariableExpression
+                            and not lhsExpr.scope.isGlobal
+                            and not capturedWrite[varKey(lhsExpr.scope, lhsExpr.id)]
+                        local nilHitLhs = false
+                        if lhsVarOk then
+                            for np = scIdx + 1, ifPos2 - 1 do
+                                if isSameVar(stmts[np].lhs[1], lhsExpr.scope, lhsExpr.id) then nilHitLhs = true end
+                            end
+                        end
                         local condPos = isVarRef(s2.condition, resSc, resId)
-                        local condNeg = (s2.condition.kind == AstKind.NotExpression and isVarRef(s2.condition.rhs, resSc, resId))
+                            or (lhsVarOk and not nilHitLhs and isVarRef(s2.condition, lhsExpr.scope, lhsExpr.id))
+                        local condNeg = (s2.condition.kind == AstKind.NotExpression
+                            and (isVarRef(s2.condition.rhs, resSc, resId)
+                                or (lhsVarOk and not nilHitLhs and isVarRef(s2.condition.rhs, lhsExpr.scope, lhsExpr.id))))
                         if condPos or condNeg then
                             local rhsSelfRead = false
                             visitNode(innerS.rhs[1], function(n)
@@ -4686,6 +5817,69 @@ function Passes.resynthesizeLogic(ast)
             end
         end)
 
+        if #ast.body.statements == 1 and ast.body.statements[1].kind == AstKind.DoStatement then
+            local doBody = ast.body.statements[1].body
+            if doBody and doBody.scope then
+                local topSc = ast.body.scope
+                local doSc = doBody.scope
+                local idMap = {}
+                local function mapDoId(did)
+                    if not idMap[did] then
+                        idMap[did] = topSc:addVariable(doSc:getVariableName(did))
+                    end
+                    return idMap[did]
+                end
+                visitNode(doBody, function(n)
+                    if n.kind == AstKind.LocalVariableDeclaration and n.scope == doSc then
+                        n.scope = topSc
+                        for j = 1, #n.ids do n.ids[j] = mapDoId(n.ids[j]) end
+                    elseif (n.kind == AstKind.LocalFunctionDeclaration or n.kind == AstKind.FunctionDeclaration)
+                        and n.scope == doSc then
+                        n.scope = topSc
+                        n.id = mapDoId(n.id)
+                    elseif (n.kind == AstKind.VariableExpression or n.kind == AstKind.AssignmentVariable)
+                        and n.scope == doSc then
+                        n.scope = topSc
+                        n.id = mapDoId(n.id)
+                    elseif n.kind == AstKind.ForStatement and n.scope == doSc then
+                        n.scope = topSc
+                        n.id = mapDoId(n.id)
+                    elseif n.kind == AstKind.ForInStatement and n.scope == doSc then
+                        n.scope = topSc
+                        for j = 1, #n.ids do n.ids[j] = mapDoId(n.ids[j]) end
+                    end
+                end, nil, ast.globalScope)
+                local function purgeDoSc(sc)
+                    if not sc then return end
+                    if sc.variablesFromHigherScopes then
+                        sc.variablesFromHigherScopes[doSc] = nil
+                    end
+                    for _, ch in ipairs(sc.children or {}) do
+                        purgeDoSc(ch)
+                    end
+                end
+                purgeDoSc(topSc)
+                local dChildren = {}
+                for _, ch in ipairs(doSc.children or {}) do
+                    dChildren[#dChildren + 1] = ch
+                end
+                for _, ch in ipairs(dChildren) do
+                    ch:setParent(topSc)
+                end
+                if doSc.parentScope then
+                    doSc.parentScope:removeChild(doSc)
+                end
+                ast.body.statements = doBody.statements
+                visitast(ast, function(n, data)
+                    if (n.kind == AstKind.VariableExpression or n.kind == AstKind.AssignmentVariable)
+                        and n.scope and not n.scope.isGlobal and data and data.scope then
+                        data.scope:addReferenceToHigherScope(n.scope, n.id)
+                    end
+                end)
+                roundChanged = true
+            end
+        end
+
         if roundChanged then
             anyChanged = true
         else
@@ -4694,6 +5888,202 @@ function Passes.resynthesizeLogic(ast)
     end
 
     return anyChanged
+end
+
+function Passes.detectSignatures(ast)
+    local sig = {
+        foldConstants = false,
+        wrapInFunction = false,
+        packedReturns = false,
+        flattenVmBridge = false,
+        splitStrings = false,
+        proxifyLocals = false,
+        constantArray = false,
+        encryptStrings = false,
+        antiTamper = false,
+        watermarks = false,
+        addedVarargs = false,
+    }
+    if not ast or not ast.body then return sig end
+
+    local stmts = ast.body.statements or {}
+    if #stmts > 0 and stmts[#stmts].kind == AstKind.ReturnStatement and #stmts[#stmts].args == 1 then
+        local rc = stmts[#stmts].args[1]
+        if rc.kind == AstKind.FunctionCallExpression and not rc.isParenthesizedExpression
+            and #rc.args == 1 and rc.args[1].kind == AstKind.VarargExpression
+            and rc.base.kind == AstKind.FunctionLiteralExpression
+            and #rc.base.args == 1 and rc.base.args[1].kind == AstKind.VarargExpression then
+            sig.wrapInFunction = true
+        end
+    end
+
+    local setmtVars = {}
+    local selectAliases = {}
+    local unpackAliases = {}
+    local hasPack, hasUnpackN = false, false
+    local funcCount, varargUnusedCount = 0, 0
+
+    visitast(ast, function(node)
+        local k = node.kind
+        if not sig.foldConstants then
+            if (k == AstKind.AddExpression or k == AstKind.SubExpression or k == AstKind.MulExpression
+                or k == AstKind.DivExpression or k == AstKind.ModExpression or k == AstKind.PowExpression)
+                and node.lhs.kind == AstKind.NumberExpression and node.rhs.kind == AstKind.NumberExpression then
+                sig.foldConstants = true
+            elseif k == AstKind.NegateExpression and node.rhs.kind == AstKind.NumberExpression then
+                sig.foldConstants = true
+            elseif k == AstKind.StrCatExpression
+                and node.lhs.kind == AstKind.StringExpression and node.rhs.kind == AstKind.StringExpression then
+                sig.foldConstants = true
+                sig.splitStrings = true
+            elseif k == AstKind.LenExpression and node.rhs.kind == AstKind.StringExpression then
+                sig.foldConstants = true
+            end
+        end
+
+        if k == AstKind.LocalVariableDeclaration and #node.ids == 1 and node.expressions and #node.expressions == 1 then
+            local vk = varKey(node.scope, node.ids[1])
+            local ex = node.expressions[1]
+            if isSetmetatableExpr(ex, setmtVars) then setmtVars[vk] = true end
+            if isSelectExpr(ex, selectAliases) then selectAliases[vk] = true end
+            if isUnpackExpr(ex, unpackAliases) then unpackAliases[vk] = true end
+            if matchSplitStringsCustomVariant(ex) then sig.splitStrings = true end
+            if ex.kind == AstKind.FunctionLiteralExpression then
+                if isPackHelperFn(ex.args, ex.body, selectAliases) then hasPack = true end
+                if isUnpackNHelperFn(ex.args, ex.body, unpackAliases) then hasUnpackN = true end
+            end
+        elseif k == AstKind.AssignmentStatement and #node.lhs == 1 and #node.rhs == 1
+            and node.lhs[1].kind == AstKind.AssignmentVariable and not node.lhs[1].scope.isGlobal then
+            local vk = varKey(node.lhs[1].scope, node.lhs[1].id)
+            local ex = node.rhs[1]
+            if isSetmetatableExpr(ex, setmtVars) then setmtVars[vk] = true end
+            if isSelectExpr(ex, selectAliases) then selectAliases[vk] = true end
+            if isUnpackExpr(ex, unpackAliases) then unpackAliases[vk] = true end
+            if matchSplitStringsCustomVariant(ex) then sig.splitStrings = true end
+            if ex.kind == AstKind.FunctionLiteralExpression then
+                if isPackHelperFn(ex.args, ex.body, selectAliases) then hasPack = true end
+                if isUnpackNHelperFn(ex.args, ex.body, unpackAliases) then hasUnpackN = true end
+            end
+        elseif k == AstKind.LocalFunctionDeclaration then
+            if matchSplitStringsCustomVariant(node) then sig.splitStrings = true end
+            if isPackHelperFn(node.args, node.body, selectAliases) then hasPack = true end
+            if isUnpackNHelperFn(node.args, node.body, unpackAliases) then hasUnpackN = true end
+        end
+
+        if not sig.proxifyLocals and k == AstKind.FunctionCallExpression then
+            if matchProxyCall(node, setmtVars) then
+                sig.proxifyLocals = true
+            end
+        end
+
+        if not sig.splitStrings and k == AstKind.FunctionCallExpression and #node.args == 1
+            and node.args[1].kind == AstKind.TableConstructorExpression then
+            if node.base.kind == AstKind.FunctionLiteralExpression and matchSplitStringsCustomVariant(node.base) then
+                sig.splitStrings = true
+            elseif node.base.kind == AstKind.IndexExpression
+                and node.base.base.kind == AstKind.VariableExpression and node.base.base.scope.isGlobal
+                and node.base.base.scope:getVariableName(node.base.base.id) == "table"
+                and node.base.index.kind == AstKind.StringExpression and node.base.index.value == "concat" then
+                sig.splitStrings = true
+            end
+        end
+
+        if not sig.encryptStrings then
+            if k == AstKind.NumberExpression and node.value == 35184372088832 then
+                sig.encryptStrings = true
+            elseif k == AstKind.DoStatement and matchEncryptStringsDoBlock(node) then
+                sig.encryptStrings = true
+            end
+        end
+
+        if not sig.antiTamper then
+            if k == AstKind.DoStatement and isAntiTamperDoBlock(node) then
+                sig.antiTamper = true
+            elseif k == AstKind.IfStatement and #node.elseifs == 0 and node.elsebody and isTamperElseBlock(node.elsebody) then
+                sig.antiTamper = true
+            end
+        end
+
+        if not sig.watermarks and matchWatermarkSetter(node) then
+            sig.watermarks = true
+        end
+
+        if not sig.packedReturns and k == AstKind.DoStatement and node.body
+            and node.body.scope and #node.body.scope.variables == 0 then
+            local hasLocals = false
+            for _, ds in ipairs(node.body.statements) do
+                if ds.kind == AstKind.LocalVariableDeclaration or ds.kind == AstKind.LocalFunctionDeclaration then
+                    hasLocals = true
+                    break
+                end
+            end
+            if not hasLocals then
+                sig.packedReturns = true
+            end
+        end
+
+        if not sig.flattenVmBridge and k == AstKind.FunctionLiteralExpression
+            and #node.args == 1 and node.args[1].kind == AstKind.VarargExpression
+            and #node.body.statements == 1 and node.body.statements[1].kind == AstKind.ReturnStatement
+            and #node.body.statements[1].args == 1 then
+            local oc = node.body.statements[1].args[1]
+            if oc.kind == AstKind.FunctionCallExpression and oc.base.kind == AstKind.FunctionLiteralExpression
+                and #oc.base.args == 1 and oc.base.args[1].kind == AstKind.VarargExpression then
+                sig.flattenVmBridge = true
+            end
+        end
+
+        if not sig.constantArray and k == AstKind.Block then
+            for i = 1, #node.statements do
+                local s = node.statements[i]
+                local cSc, cId, cTbl
+                if s.kind == AstKind.LocalVariableDeclaration and #s.ids == 1 and s.expressions and #s.expressions == 1
+                    and s.expressions[1].kind == AstKind.TableConstructorExpression then
+                    cSc, cId, cTbl = s.scope, s.ids[1], s.expressions[1]
+                elseif s.kind == AstKind.AssignmentStatement and #s.lhs == 1 and #s.rhs == 1
+                    and s.lhs[1].kind == AstKind.AssignmentVariable and not s.lhs[1].scope.isGlobal
+                    and s.rhs[1].kind == AstKind.TableConstructorExpression then
+                    cSc, cId, cTbl = s.lhs[1].scope, s.lhs[1].id, s.rhs[1]
+                end
+                if cTbl and #cTbl.entries > 0 then
+                    for j = i + 1, #node.statements do
+                        local ws = node.statements[j]
+                        local wFn
+                        if ws.kind == AstKind.LocalFunctionDeclaration then wFn = ws
+                        elseif ws.kind == AstKind.LocalVariableDeclaration and #ws.ids == 1 and ws.expressions and #ws.expressions == 1
+                            and ws.expressions[1].kind == AstKind.FunctionLiteralExpression then wFn = ws.expressions[1]
+                        elseif ws.kind == AstKind.AssignmentStatement and #ws.lhs == 1 and #ws.rhs == 1
+                            and ws.rhs[1].kind == AstKind.FunctionLiteralExpression then wFn = ws.rhs[1]
+                        end
+                        if wFn and effectiveArgCount(wFn.args) == 1 and wFn.args[1].kind == AstKind.VariableExpression
+                            and #wFn.body.statements == 1 and wFn.body.statements[1].kind == AstKind.ReturnStatement
+                            and #wFn.body.statements[1].args == 1
+                            and parseOffsetIndexing(wFn.body.statements[1].args[1], cSc, cId, wFn.args[1].scope, wFn.args[1].id) ~= nil then
+                            sig.constantArray = true
+                            break
+                        end
+                    end
+                end
+                if sig.constantArray then break end
+            end
+        end
+
+        if FUNCTION_KINDS[k] and node.args and #node.args > 0 and node.args[#node.args].kind == AstKind.VarargExpression then
+            funcCount = funcCount + 1
+            if not functionBodyUsesVararg(node.body) then
+                varargUnusedCount = varargUnusedCount + 1
+            end
+        end
+    end)
+
+    if hasPack and hasUnpackN then
+        sig.packedReturns = true
+    end
+    if funcCount > 0 and varargUnusedCount > 0 then
+        sig.addedVarargs = true
+    end
+
+    return sig
 end
 
 return Passes

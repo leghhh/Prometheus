@@ -44,8 +44,14 @@ local UNARY_CONSTRUCTORS = {
 }
 
 local function isVarRef(node, scope, id)
-    return node and (node.kind == AstKind.VariableExpression or node.kind == AstKind.AssignmentVariable)
-        and node.scope == scope and node.id == id
+    if not node or (node.kind ~= AstKind.VariableExpression and node.kind ~= AstKind.AssignmentVariable)
+        or node.scope ~= scope then
+        return false
+    end
+    if type(id) == "table" then
+        return id[node.id] == true
+    end
+    return node.id == id
 end
 
 local function visitSub(rootNode, previsit, postvisit, globalScope)
@@ -158,6 +164,134 @@ local function wrapContinueForLua51(bodyStmts, loopScope, hasOuterBreak)
     return out
 end
 
+local function classifyOuterArgExpr(expr, localDefs)
+    if not expr then return nil, nil end
+    if expr.kind == AstKind.VariableExpression then
+        if expr.scope and expr.scope.isGlobal then
+            return "global", expr.scope:getVariableName(expr.id)
+        end
+        local def = localDefs and localDefs[tostring(expr.scope) .. ":" .. tostring(expr.id)]
+        if def then
+            return def.kind, def.name
+        end
+        return nil, nil
+    end
+    if expr.kind == AstKind.OrExpression then
+        if expr.lhs.kind == AstKind.AndExpression then
+            return "env", nil
+        elseif expr.rhs.kind == AstKind.IndexExpression then
+            return "unpack", nil
+        else
+            local lk, ln = classifyOuterArgExpr(expr.lhs, localDefs)
+            local rk, rn = classifyOuterArgExpr(expr.rhs, localDefs)
+            if rk == "global" and rn == "_ENV" then
+                return "env", nil
+            elseif (lk == "global" and ln == "unpack") or expr.rhs.kind == AstKind.IndexExpression then
+                return "unpack", nil
+            end
+        end
+    elseif expr.kind == AstKind.TableConstructorExpression then
+        return "arg", nil
+    end
+    return nil, nil
+end
+
+local function buildBlockLocalArgDefs(stmts, maxIdx)
+    local defs = {}
+    local pureSetup = true
+    for idx = 1, maxIdx do
+        local s = stmts[idx]
+        if s.kind == AstKind.LocalVariableDeclaration then
+            if s.expressions and #s.expressions > 0 then
+                for j = 1, #s.ids do
+                    local ex = s.expressions[j]
+                    if ex then
+                        local k, nm = classifyOuterArgExpr(ex, defs)
+                        if k then
+                            defs[tostring(s.scope) .. ":" .. tostring(s.ids[j])] = { kind = k, name = nm }
+                        elseif ex.kind == AstKind.AndExpression then
+                            defs[tostring(s.scope) .. ":" .. tostring(s.ids[j])] = { kind = "partial_env" }
+                        elseif ex.kind ~= AstKind.NilExpression then
+                            pureSetup = false
+                        end
+                    end
+                end
+            end
+        elseif s.kind == AstKind.AssignmentStatement then
+            for j = 1, #s.lhs do
+                local lv = s.lhs[j]
+                local ex = s.rhs[j]
+                if lv.kind == AstKind.AssignmentVariable and not lv.scope.isGlobal and ex then
+                    local k, nm = classifyOuterArgExpr(ex, defs)
+                    if k then
+                        defs[tostring(lv.scope) .. ":" .. tostring(lv.id)] = { kind = k, name = nm }
+                    elseif ex.kind == AstKind.AndExpression then
+                        defs[tostring(lv.scope) .. ":" .. tostring(lv.id)] = { kind = "partial_env" }
+                    elseif ex.kind ~= AstKind.NilExpression then
+                        pureSetup = false
+                    end
+                else
+                    pureSetup = false
+                end
+            end
+        elseif s.kind == AstKind.IfStatement and #s.elseifs == 0 and not s.elsebody then
+            local wroteEnv = false
+            local wroteUnpack = false
+            for _, bs in ipairs(s.body.statements) do
+                if bs.kind == AstKind.AssignmentStatement and #bs.lhs == 1 and #bs.rhs == 1
+                    and bs.lhs[1].kind == AstKind.AssignmentVariable and not bs.lhs[1].scope.isGlobal then
+                    local vk = tostring(bs.lhs[1].scope) .. ":" .. tostring(bs.lhs[1].id)
+                    local r = bs.rhs[1]
+                    if r.kind == AstKind.VariableExpression and r.scope.isGlobal and r.scope:getVariableName(r.id) == "_ENV" then
+                        defs[vk] = { kind = "env" }
+                        wroteEnv = true
+                    elseif r.kind == AstKind.IndexExpression then
+                        defs[vk] = { kind = "unpack" }
+                        wroteUnpack = true
+                    end
+                end
+            end
+            if not wroteEnv and not wroteUnpack then
+                local condVar = s.condition
+                if condVar.kind == AstKind.VariableExpression and not condVar.scope.isGlobal then
+                    local vk = tostring(condVar.scope) .. ":" .. tostring(condVar.id)
+                    if defs[vk] and defs[vk].name == "getfenv" then
+                        defs[vk] = { kind = "partial_env" }
+                    else
+                        pureSetup = false
+                    end
+                else
+                    pureSetup = false
+                end
+            end
+        else
+            pureSetup = false
+        end
+    end
+    return defs, pureSetup
+end
+
+local function extractThreeArgInnerClosure(fnNode)
+    for _, st in ipairs(fnNode.body.statements) do
+        if st.kind == AstKind.LocalFunctionDeclaration then
+            return st
+        elseif st.kind == AstKind.LocalVariableDeclaration and st.expressions then
+            for _, ex in ipairs(st.expressions) do
+                if ex.kind == AstKind.FunctionLiteralExpression then
+                    return ex
+                end
+            end
+        elseif st.kind == AstKind.AssignmentStatement then
+            for _, ex in ipairs(st.rhs) do
+                if ex.kind == AstKind.FunctionLiteralExpression then
+                    return ex
+                end
+            end
+        end
+    end
+    return nil
+end
+
 local function matchCffContainer(block, globalScope)
     local stmts = block.statements
     if #stmts == 0 then return nil end
@@ -166,25 +300,94 @@ local function matchCffContainer(block, globalScope)
     local outerCall = retStmt.args[1]
     if outerCall.kind ~= AstKind.FunctionCallExpression then return nil end
     local fnNode = outerCall.base
+    if fnNode.kind == AstKind.VariableExpression and not fnNode.scope.isGlobal then
+        local fSc, fId = fnNode.scope, fnNode.id
+        for idx = #stmts - 1, 1, -1 do
+            local ps = stmts[idx]
+            if ps.kind == AstKind.LocalVariableDeclaration and ps.scope == fSc then
+                for j = 1, #ps.ids do
+                    if ps.ids[j] == fId and ps.expressions and ps.expressions[j] then
+                        if ps.expressions[j].kind == AstKind.FunctionLiteralExpression then
+                            fnNode = ps.expressions[j]
+                        end
+                        break
+                    end
+                end
+                if fnNode.kind == AstKind.FunctionLiteralExpression then break end
+            elseif ps.kind == AstKind.LocalFunctionDeclaration and ps.scope == fSc and ps.id == fId then
+                fnNode = Ast.FunctionLiteralExpression(ps.args, ps.body)
+                break
+            elseif ps.kind == AstKind.AssignmentStatement then
+                for j = 1, #ps.lhs do
+                    if ps.lhs[j].kind == AstKind.AssignmentVariable
+                        and ps.lhs[j].scope == fSc and ps.lhs[j].id == fId and ps.rhs[j] then
+                        if ps.rhs[j].kind == AstKind.FunctionLiteralExpression then
+                            fnNode = ps.rhs[j]
+                        elseif ps.rhs[j].kind == AstKind.VariableExpression and not ps.rhs[j].scope.isGlobal then
+                            fSc, fId = ps.rhs[j].scope, ps.rhs[j].id
+                        end
+                        break
+                    end
+                end
+                if fnNode.kind == AstKind.FunctionLiteralExpression then break end
+            end
+        end
+    end
     if fnNode.kind ~= AstKind.FunctionLiteralExpression then return nil end
     if #outerCall.args ~= 11 or #fnNode.args < 23 then return nil end
-    if #fnNode.body.statements ~= 2 then return nil end
+    if #fnNode.body.statements < 2 then return nil end
 
-    local initAssign = fnNode.body.statements[1]
-    local innerRet = fnNode.body.statements[2]
-    if initAssign.kind ~= AstKind.AssignmentStatement or innerRet.kind ~= AstKind.ReturnStatement then
-        return nil
-    end
-    if #initAssign.lhs ~= #initAssign.rhs or #initAssign.lhs < 12 or #innerRet.args ~= 1 then
+    local innerRet = fnNode.body.statements[#fnNode.body.statements]
+    if innerRet.kind ~= AstKind.ReturnStatement or #innerRet.args ~= 1 then
         return nil
     end
 
     local cffScope = fnNode.body.scope
+    local helperBindings = {}
+    for sIdx = 1, #fnNode.body.statements - 1 do
+        local st = fnNode.body.statements[sIdx]
+        if st.kind == AstKind.AssignmentStatement then
+            if #st.lhs ~= #st.rhs then return nil end
+            for i = 1, #st.lhs do
+                local lhs = st.lhs[i]
+                if lhs.kind == AstKind.AssignmentVariable and lhs.scope == cffScope then
+                    helperBindings[#helperBindings + 1] = { vid = lhs.id, rhs = st.rhs[i] }
+                elseif lhs.kind == AstKind.AssignmentIndexing
+                    and lhs.base.kind == AstKind.VariableExpression
+                    and lhs.base.scope == cffScope then
+                else
+                    return nil
+                end
+            end
+        elseif st.kind == AstKind.LocalVariableDeclaration and st.scope == cffScope then
+            if st.expressions then
+                for i = 1, #st.ids do
+                    if st.expressions[i] then
+                        helperBindings[#helperBindings + 1] = { vid = st.ids[i], rhs = st.expressions[i] }
+                    end
+                end
+            end
+        elseif st.kind == AstKind.LocalFunctionDeclaration and st.scope == cffScope then
+            helperBindings[#helperBindings + 1] = {
+                vid = st.id,
+                rhs = Ast.FunctionLiteralExpression(st.args, st.body),
+            }
+        else
+            return nil
+        end
+    end
+    if #helperBindings < 11 then
+        return nil
+    end
+
+    local localDefs, pureOuterSetup = buildBlockLocalArgDefs(stmts, #stmts - 1)
     local info = {
         cffScope = cffScope,
         globalScope = globalScope,
         createClosureArity = {},
+        cffAliases = {},
         regVarLookup = {},
+        pureOuterSetup = pureOuterSetup,
     }
 
     for i = 1, 11 do
@@ -193,16 +396,14 @@ local function matchCffContainer(block, globalScope)
         if param.kind ~= AstKind.VariableExpression or param.scope ~= cffScope then
             return nil
         end
-        if arg.kind == AstKind.OrExpression then
-            if arg.lhs.kind == AstKind.AndExpression then
-                info.envVar = param.id
-            elseif arg.rhs.kind == AstKind.IndexExpression then
-                info.unpackVar = param.id
-            end
-        elseif arg.kind == AstKind.TableConstructorExpression then
+        local akind, gname = classifyOuterArgExpr(arg, localDefs)
+        if akind == "env" then
+            info.envVar = param.id
+        elseif akind == "unpack" then
+            info.unpackVar = param.id
+        elseif akind == "arg" then
             info.argVar = param.id
-        elseif arg.kind == AstKind.VariableExpression and arg.scope and arg.scope.isGlobal then
-            local gname = arg.scope:getVariableName(arg.id)
+        elseif akind == "global" then
             if gname == "newproxy" then info.newproxyVar = param.id
             elseif gname == "setmetatable" then info.setmetatableVar = param.id
             elseif gname == "getmetatable" then info.getmetatableVar = param.id
@@ -222,13 +423,17 @@ local function matchCffContainer(block, globalScope)
     local emptyTables = {}
     local threeArgFns = {}
 
-    for i = 1, #initAssign.lhs do
-        local lhs = initAssign.lhs[i]
-        local rhs = initAssign.rhs[i]
-        if lhs.kind ~= AstKind.AssignmentVariable or lhs.scope ~= cffScope then
-            return nil
+    for i = 1, #helperBindings do
+        local vid = helperBindings[i].vid
+        local rhs = helperBindings[i].rhs
+        if rhs.kind == AstKind.VariableExpression and rhs.scope == cffScope then
+            info.cffAliases[vid] = info.cffAliases[rhs.id] or rhs.id
         end
-        local vid = lhs.id
+    end
+
+    for i = 1, #helperBindings do
+        local vid = helperBindings[i].vid
+        local rhs = helperBindings[i].rhs
         if rhs.kind == AstKind.NumberExpression and rhs.value == 0 then
             info.currentUpvalId = vid
         elseif rhs.kind == AstKind.TableConstructorExpression and #rhs.entries == 0 then
@@ -247,19 +452,50 @@ local function matchCffContainer(block, globalScope)
                     info.containerFuncVar = vid
                     info.containerFunc = rhs
                     info.containerScope = rhs.body.scope
-                    info.posVar = rhs.args[1].id
-                    info.argsVar = rhs.args[2].id
-                    info.currentUpvaluesVar = rhs.args[3].id
-                    info.detectGcCollectVar = rhs.args[4].id
-                    info.currentEnvVar = rhs.args[5].id
+                    info.posVar = { [rhs.args[1].id] = true }
+                    info.argsVar = { [rhs.args[2].id] = true }
+                    info.currentUpvaluesVar = { [rhs.args[3].id] = true }
+                    info.detectGcCollectVar = { [rhs.args[4].id] = true }
+                    info.currentEnvVar = { [rhs.args[5].id] = true }
+                    for _, s in ipairs(rhs.body.statements) do
+                        if s == info.whileStmt then break end
+                        if s.kind == AstKind.AssignmentStatement and #s.lhs == 1 and #s.rhs == 1
+                            and s.lhs[1].kind == AstKind.AssignmentVariable and s.lhs[1].scope == info.containerScope
+                            and s.rhs[1].kind == AstKind.VariableExpression and s.rhs[1].scope == info.containerScope then
+                            local srcId, dstId = s.rhs[1].id, s.lhs[1].id
+                            if info.posVar[srcId] then info.posVar[dstId] = true
+                            elseif info.argsVar[srcId] then info.argsVar[dstId] = true
+                            elseif info.currentUpvaluesVar[srcId] then info.currentUpvaluesVar[dstId] = true
+                            elseif info.detectGcCollectVar[srcId] then info.detectGcCollectVar[dstId] = true
+                            elseif info.currentEnvVar[srcId] then info.currentEnvVar[dstId] = true
+                            end
+                        elseif s.kind == AstKind.LocalVariableDeclaration and s.scope == info.containerScope
+                            and s.expressions then
+                            for idxD = 1, #s.ids do
+                                local ex = s.expressions[idxD]
+                                if ex and ex.kind == AstKind.VariableExpression and ex.scope == info.containerScope then
+                                    local srcId, dstId = ex.id, s.ids[idxD]
+                                    if info.posVar[srcId] then info.posVar[dstId] = true
+                                    elseif info.argsVar[srcId] then info.argsVar[dstId] = true
+                                    elseif info.currentUpvaluesVar[srcId] then info.currentUpvaluesVar[dstId] = true
+                                    elseif info.detectGcCollectVar[srcId] then info.detectGcCollectVar[dstId] = true
+                                    elseif info.currentEnvVar[srcId] then info.currentEnvVar[dstId] = true
+                                    end
+                                end
+                            end
+                        end
+                    end
                 end
             elseif nargs == 0 then
                 info.allocUpvalFunction = vid
-                if #rhs.body.statements == 3 and rhs.body.statements[2].kind == AstKind.AssignmentStatement then
-                    local idxLhs = rhs.body.statements[2].lhs[1]
-                    if idxLhs and idxLhs.kind == AstKind.AssignmentIndexing
-                        and idxLhs.base.kind == AstKind.VariableExpression and idxLhs.base.scope == cffScope then
-                        info.upvaluesReferenceCountsTable = idxLhs.base.id
+                for _, s in ipairs(rhs.body.statements) do
+                    if s.kind == AstKind.AssignmentStatement and #s.lhs >= 1 then
+                        local idxLhs = s.lhs[1]
+                        if idxLhs and idxLhs.kind == AstKind.AssignmentIndexing
+                            and idxLhs.base.kind == AstKind.VariableExpression and idxLhs.base.scope == cffScope then
+                            info.upvaluesReferenceCountsTable = idxLhs.base.id
+                            break
+                        end
                     end
                 end
             elseif nargs == 1 and rhs.args[1].kind == AstKind.VarargExpression then
@@ -269,32 +505,52 @@ local function matchCffContainer(block, globalScope)
             elseif nargs == 3 and rhs.args[3].kind == AstKind.VariableExpression then
                 threeArgFns[#threeArgFns + 1] = { vid = vid, fn = rhs }
             elseif nargs == 1 and rhs.args[1].kind == AstKind.VariableExpression then
-                local bstmts = rhs.body.statements
+                local bstmts = {}
+                for k = 1, #rhs.body.statements do
+                    local bs = rhs.body.statements[k]
+                    if not (k == #rhs.body.statements and bs.kind == AstKind.ReturnStatement and #bs.args == 0) then
+                        bstmts[#bstmts + 1] = bs
+                    end
+                end
+                local hasWhile, hasFor, hasIf = false, false, false
+                for _, bs in ipairs(bstmts) do
+                    if bs.kind == AstKind.WhileStatement then hasWhile = true
+                    elseif bs.kind == AstKind.ForStatement then hasFor = true
+                    elseif bs.kind == AstKind.IfStatement then hasIf = true
+                    end
+                end
                 if #bstmts == 1 and bstmts[1].kind == AstKind.ReturnStatement then
                     info.unpackPackedVar = vid
-                elseif #bstmts == 2 and bstmts[1].kind == AstKind.LocalVariableDeclaration and bstmts[2].kind == AstKind.WhileStatement then
+                elseif hasWhile then
                     info.upvaluesGcFunctionVar = vid
-                elseif #bstmts == 2 and bstmts[1].kind == AstKind.ForStatement then
+                elseif hasFor then
                     info.upvaluesProxyFunctionVar = vid
-                elseif #bstmts == 2 and bstmts[1].kind == AstKind.AssignmentStatement and bstmts[2].kind == AstKind.IfStatement then
+                elseif hasIf then
                     info.freeUpvalueFunc = vid
+                    visitSub(rhs, function(fnN)
+                        if fnN.kind == AstKind.AssignmentIndexing
+                            and fnN.base.kind == AstKind.VariableExpression
+                            and fnN.base.scope == cffScope
+                            and fnN.base.id ~= info.upvaluesReferenceCountsTable then
+                            info.upvaluesTable = fnN.base.id
+                        end
+                    end, nil, globalScope)
                 end
             end
         end
     end
 
-    for _, tvid in ipairs(emptyTables) do
-        if tvid ~= info.upvaluesReferenceCountsTable then
-            info.upvaluesTable = tvid
+    if not info.upvaluesTable then
+        for _, tvid in ipairs(emptyTables) do
+            if tvid ~= info.upvaluesReferenceCountsTable then
+                info.upvaluesTable = tvid
+            end
         end
     end
 
     for _, item in ipairs(threeArgFns) do
-        local bstmts = item.fn.body.statements
-        if #bstmts >= 3 and bstmts[2].kind == AstKind.LocalVariableDeclaration
-            and bstmts[2].expressions and bstmts[2].expressions[1]
-            and bstmts[2].expressions[1].kind == AstKind.FunctionLiteralExpression then
-            local innerFn = bstmts[2].expressions[1]
+        local innerFn = extractThreeArgInnerClosure(item.fn)
+        if innerFn then
             if #innerFn.args == 1 and innerFn.args[1].kind == AstKind.VarargExpression then
                 info.createVarargClosureVar = item.vid
             else
@@ -305,7 +561,7 @@ local function matchCffContainer(block, globalScope)
 
     if not info.containerFunc or not info.whileStmt or not info.packVar
         or not info.unpackPackedVar or not info.callFunctionVar
-        or not info.createVarargClosureVar or not info.upvaluesTable then
+        or not info.upvaluesTable then
         return nil
     end
 
@@ -323,19 +579,50 @@ local function matchCffContainer(block, globalScope)
     info.returnVar = finalUnpack.args[1].id
 
     for _, s in ipairs(cStmts) do
+        if s == info.whileStmt then break end
         if s.kind == AstKind.LocalVariableDeclaration and s.scope == info.containerScope then
             if #s.ids == 1 and s.expressions and #s.expressions == 1
                 and s.expressions[1].kind == AstKind.TableConstructorExpression then
                 info.spillVarId = s.ids[1]
-            elseif not s.expressions or #s.expressions == 0 then
+            else
                 for _, id in ipairs(s.ids) do
-                    if id ~= info.returnVar then
+                    if id ~= info.returnVar
+                        and not info.posVar[id]
+                        and not info.argsVar[id]
+                        and not info.currentUpvaluesVar[id]
+                        and not info.detectGcCollectVar[id]
+                        and not info.currentEnvVar[id] then
                         info.regVarLookup[id] = true
                     end
                 end
             end
+        elseif s.kind == AstKind.AssignmentStatement and #s.lhs == 1 and #s.rhs == 1
+            and s.lhs[1].kind == AstKind.AssignmentVariable and s.lhs[1].scope == info.containerScope
+            and s.rhs[1].kind == AstKind.TableConstructorExpression and #s.rhs[1].entries == 0
+            and not info.spillVarId then
+            info.spillVarId = s.lhs[1].id
+            info.regVarLookup[info.spillVarId] = nil
         end
     end
+
+    info.dispatchScopes = {}
+    visitSub(info.whileStmt, function(wn)
+        if wn.kind == AstKind.FunctionLiteralExpression
+            or wn.kind == AstKind.LocalFunctionDeclaration
+            or wn.kind == AstKind.FunctionDeclaration then
+            return nil, true
+        end
+        if wn.kind == AstKind.LocalVariableDeclaration and wn.scope
+            and wn.scope ~= info.containerScope and wn.scope ~= cffScope and not wn.scope.isGlobal then
+            info.dispatchScopes[wn.scope] = true
+        end
+        if wn.body and wn.body.scope and wn.body.scope ~= info.containerScope and not wn.body.scope.isGlobal then
+            info.dispatchScopes[wn.body.scope] = true
+        end
+        if wn.elsebody and wn.elsebody.scope and wn.elsebody.scope ~= info.containerScope and not wn.elsebody.scope.isGlobal then
+            info.dispatchScopes[wn.elsebody.scope] = true
+        end
+    end, nil, globalScope)
 
     local bootCall = innerRet.args[1]
     if bootCall.kind ~= AstKind.FunctionCallExpression
@@ -343,7 +630,16 @@ local function matchCffContainer(block, globalScope)
         return nil
     end
     local createBoot = bootCall.base
-    if not isVarRef(createBoot.base, cffScope, info.createVarargClosureVar) or #createBoot.args < 2 then
+    local bootOk = false
+    if info.createVarargClosureVar and isVarRef(createBoot.base, cffScope, info.createVarargClosureVar) then
+        bootOk = true
+    elseif createBoot.base.kind == AstKind.FunctionLiteralExpression and #createBoot.base.args == 3 then
+        local innerBootFn = extractThreeArgInnerClosure(createBoot.base)
+        if innerBootFn and #innerBootFn.args == 1 and innerBootFn.args[1].kind == AstKind.VarargExpression then
+            bootOk = true
+        end
+    end
+    if not bootOk or #createBoot.args < 2 then
         return nil
     end
     if createBoot.args[1].kind ~= AstKind.NumberExpression
@@ -354,6 +650,35 @@ local function matchCffContainer(block, globalScope)
     info.topUpvalCount = #createBoot.args[2].entries
 
     return info
+end
+
+local function regKeyOfNode(node, info)
+    if not node then return nil end
+    if node.kind == AstKind.VariableExpression or node.kind == AstKind.AssignmentVariable then
+        if node.scope == info.containerScope then
+            local id = node.id
+            if id ~= info.returnVar
+                and id ~= info.spillVarId
+                and not info.posVar[id]
+                and not info.argsVar[id]
+                and not info.currentUpvaluesVar[id]
+                and not info.detectGcCollectVar[id]
+                and not info.currentEnvVar[id] then
+                return "r_" .. tostring(id)
+            end
+            return nil
+        end
+        if info.dispatchScopes and info.dispatchScopes[node.scope] then
+            return "d_" .. tostring(node.scope) .. "_" .. tostring(node.id)
+        end
+    end
+    if (node.kind == AstKind.IndexExpression or node.kind == AstKind.AssignmentIndexing)
+        and info.spillVarId
+        and isVarRef(node.base, info.containerScope, info.spillVarId)
+        and node.index.kind == AstKind.NumberExpression then
+        return "s_" .. tostring(node.index.value)
+    end
+    return nil
 end
 
 local function extractDispatchLeaves(info)
@@ -378,34 +703,98 @@ local function extractDispatchLeaves(info)
         return nil, nil
     end
 
-    local function walkDispatch(blk, lo, hi)
-        if #blk.statements == 1 and blk.statements[1].kind == AstKind.IfStatement and blk.statements[1].elsebody then
-            local ifs = blk.statements[1]
-            local dir, bound = matchPosBound(ifs.condition)
-            if dir then
-                if #ifs.elseifs > 0 then
-                    local curLo = lo
-                    if dir ~= "lt" then return nil end
-                    walkDispatch(ifs.body, curLo, bound)
-                    curLo = bound
-                    for _, eif in ipairs(ifs.elseifs) do
-                        local edir, ebound = matchPosBound(eif.condition)
-                        if edir ~= "lt" then return nil end
-                        walkDispatch(eif.body, curLo, ebound)
-                        curLo = ebound
-                    end
-                    walkDispatch(ifs.elsebody, curLo, hi)
-                    return
+    local function resolveDispatchIf(blk)
+        local n = #blk.statements
+        if n == 0 then return nil, nil, nil, nil end
+        local last = blk.statements[n]
+        if last.kind ~= AstKind.IfStatement or not last.elsebody then
+            return nil, nil, nil, nil
+        end
+        local tempMap = {}
+        local function expandDispExpr(e, depth)
+            if not e or depth > 6 then return e end
+            if e.kind == AstKind.VariableExpression and not isVarRef(e, containerScope, posVar) then
+                local rk = regKeyOfNode(e, info)
+                local mapped = rk and tempMap[rk] or nil
+                if mapped then return expandDispExpr(mapped, depth + 1) end
+            elseif e.kind == AstKind.LessThanExpression then
+                return Ast.LessThanExpression(expandDispExpr(e.lhs, depth + 1), expandDispExpr(e.rhs, depth + 1))
+            elseif e.kind == AstKind.GreaterThanExpression then
+                return Ast.GreaterThanExpression(expandDispExpr(e.lhs, depth + 1), expandDispExpr(e.rhs, depth + 1))
+            end
+            return e
+        end
+        for i = 1, n - 1 do
+            local s = blk.statements[i]
+            if s.kind == AstKind.AssignmentStatement and #s.lhs == 1 and #s.rhs == 1 then
+                local lk = regKeyOfNode(s.lhs[1], info)
+                if not lk then return nil, nil, nil, nil end
+                local r = s.rhs[1]
+                if r.kind == AstKind.NilExpression then
+                    tempMap[lk] = nil
+                elseif r.kind == AstKind.NumberExpression
+                    or r.kind == AstKind.LessThanExpression
+                    or r.kind == AstKind.GreaterThanExpression
+                    or isVarRef(r, containerScope, posVar)
+                    or regKeyOfNode(r, info) ~= nil then
+                    tempMap[lk] = expandDispExpr(r, 0)
                 else
-                    if dir == "lt" then
-                        walkDispatch(ifs.body, lo, bound)
-                        walkDispatch(ifs.elsebody, bound, hi)
-                    else
-                        walkDispatch(ifs.elsebody, lo, bound)
-                        walkDispatch(ifs.body, bound, hi)
-                    end
-                    return
+                    return nil, nil, nil, nil
                 end
+            elseif s.kind == AstKind.LocalVariableDeclaration
+                and (s.scope == containerScope or info.dispatchScopes[s.scope]) then
+                if s.expressions and #s.expressions > 0 then
+                    for j = 1, #s.ids do
+                        local ex = s.expressions[j]
+                        local lk = s.scope == containerScope and ("r_" .. tostring(s.ids[j]))
+                            or ("d_" .. tostring(s.scope) .. "_" .. tostring(s.ids[j]))
+                        if not ex or ex.kind == AstKind.NilExpression then
+                            tempMap[lk] = nil
+                        elseif ex.kind == AstKind.NumberExpression
+                            or ex.kind == AstKind.LessThanExpression
+                            or ex.kind == AstKind.GreaterThanExpression
+                            or isVarRef(ex, containerScope, posVar)
+                            or regKeyOfNode(ex, info) ~= nil then
+                            tempMap[lk] = expandDispExpr(ex, 0)
+                        else
+                            return nil, nil, nil, nil
+                        end
+                    end
+                end
+            else
+                return nil, nil, nil, nil
+            end
+        end
+        local dir, bound = matchPosBound(expandDispExpr(last.condition, 0))
+        if not dir then return nil, nil, nil, nil end
+        return last, dir, bound, expandDispExpr
+    end
+
+    local function walkDispatch(blk, lo, hi)
+        local ifs, dir, bound, expandDispExpr = resolveDispatchIf(blk)
+        if ifs and dir then
+            if #ifs.elseifs > 0 then
+                local curLo = lo
+                if dir ~= "lt" then return nil end
+                walkDispatch(ifs.body, curLo, bound)
+                curLo = bound
+                for _, eif in ipairs(ifs.elseifs) do
+                    local edir, ebound = matchPosBound(expandDispExpr(eif.condition, 0))
+                    if edir ~= "lt" then return nil end
+                    walkDispatch(eif.body, curLo, ebound)
+                    curLo = ebound
+                end
+                walkDispatch(ifs.elsebody, curLo, hi)
+                return
+            else
+                if dir == "lt" then
+                    walkDispatch(ifs.body, lo, bound)
+                    walkDispatch(ifs.elsebody, bound, hi)
+                else
+                    walkDispatch(ifs.elsebody, lo, bound)
+                    walkDispatch(ifs.body, bound, hi)
+                end
+                return
             end
         end
         leaves[#leaves + 1] = {
@@ -437,21 +826,6 @@ local function extractDispatchLeaves(info)
     return leaves, leafForId
 end
 
-local function regKeyOfNode(node, info)
-    if not node then return nil end
-    if (node.kind == AstKind.VariableExpression or node.kind == AstKind.AssignmentVariable)
-        and node.scope == info.containerScope and info.regVarLookup[node.id] then
-        return "r_" .. tostring(node.id)
-    end
-    if (node.kind == AstKind.IndexExpression or node.kind == AstKind.AssignmentIndexing)
-        and info.spillVarId
-        and isVarRef(node.base, info.containerScope, info.spillVarId)
-        and node.index.kind == AstKind.NumberExpression then
-        return "s_" .. tostring(node.index.value)
-    end
-    return nil
-end
-
 local function normalizeLeafStatements(rawStmts, info, leafForId)
     local flat = {}
     for _, s in ipairs(rawStmts) do
@@ -459,17 +833,46 @@ local function normalizeLeafStatements(rawStmts, info, leafForId)
             for j = 1, #s.lhs do
                 flat[#flat + 1] = Ast.AssignmentStatement({ s.lhs[j] }, { s.rhs[j] })
             end
+        elseif s.kind == AstKind.LocalVariableDeclaration
+            and (s.scope == info.containerScope or (info.dispatchScopes and info.dispatchScopes[s.scope])) then
+            if s.expressions and #s.expressions > 0 then
+                for j = 1, #s.ids do
+                    local ex = s.expressions[j] or Ast.NilExpression()
+                    flat[#flat + 1] = Ast.AssignmentStatement({ Ast.AssignmentVariable(s.scope, s.ids[j]) }, { ex })
+                end
+            end
         else
             flat[#flat + 1] = s
         end
     end
 
     local constNumInReg = {}
+    local envLookupInReg = {}
+    local currentEnvAlias = {}
+    local branchInVar = {}
+    local pendingAndInVar = {}
     local pendingPosAnd = nil
+    local pendingPosCond = nil
     local term = nil
     local body = {}
 
+    local function varNodeKey(e)
+        if not e then return nil end
+        if e.kind == AstKind.VariableExpression or e.kind == AstKind.AssignmentVariable then
+            return tostring(e.scope) .. ":" .. tostring(e.id)
+        end
+        return regKeyOfNode(e, info)
+    end
+
+    local function isCurrentEnvExpr(e)
+        if not e then return false end
+        if isVarRef(e, info.containerScope, info.currentEnvVar) then return true end
+        local rk = regKeyOfNode(e, info)
+        return rk ~= nil and currentEnvAlias[rk] == true
+    end
+
     local function evalNumOrReg(expr)
+        if not expr then return nil end
         if expr.kind == AstKind.NumberExpression then
             return expr.value
         end
@@ -480,25 +883,116 @@ local function normalizeLeafStatements(rawStmts, info, leafForId)
         return nil
     end
 
+    local function evalSingleBranchIfTarget(blk)
+        if not blk or #blk.statements == 0 then return nil, nil end
+        local localNums = {}
+        local lastVk, lastNum = nil, nil
+        for i = 1, #blk.statements do
+            local bs = blk.statements[i]
+            if bs.kind ~= AstKind.AssignmentStatement or #bs.lhs ~= 1 or #bs.rhs ~= 1 then
+                return nil, nil
+            end
+            local lk = varNodeKey(bs.lhs[1])
+            if not lk or isVarRef(bs.lhs[1], info.containerScope, info.posVar) then
+                return nil, nil
+            end
+            local num = evalNumOrReg(bs.rhs[1])
+            if num == nil then
+                local rk = varNodeKey(bs.rhs[1])
+                if rk and localNums[rk] ~= nil then
+                    num = localNums[rk]
+                end
+            end
+            if num == nil then
+                return nil, nil
+            end
+            localNums[lk] = num
+            lastVk, lastNum = lk, num
+        end
+        return lastVk, lastNum
+    end
+
+    local function evalSingleBranchPosTarget(blk)
+        if not blk or #blk.statements == 0 then return nil end
+        local localNums = {}
+        local posNum = nil
+        for i = 1, #blk.statements do
+            local bs = blk.statements[i]
+            if bs.kind ~= AstKind.AssignmentStatement or #bs.lhs ~= 1 or #bs.rhs ~= 1 then
+                return nil
+            end
+            local num = evalNumOrReg(bs.rhs[1])
+            if num == nil then
+                local rk = varNodeKey(bs.rhs[1])
+                if rk and localNums[rk] ~= nil then
+                    num = localNums[rk]
+                end
+            end
+            if num == nil then return nil end
+            if isVarRef(bs.lhs[1], info.containerScope, info.posVar) then
+                posNum = num
+            else
+                local lk = varNodeKey(bs.lhs[1])
+                if not lk then return nil end
+                localNums[lk] = num
+            end
+        end
+        return posNum
+    end
+
+    local function removeBodyStmt(targetStmt)
+        if not targetStmt then return end
+        for idx = #body, 1, -1 do
+            if body[idx] == targetStmt then
+                table.remove(body, idx)
+                return
+            end
+        end
+    end
+
     for _, s in ipairs(flat) do
         local handledPos = false
         if s.kind == AstKind.AssignmentStatement and #s.lhs == 1 and #s.rhs == 1 then
             local lhs, rhs = s.lhs[1], s.rhs[1]
             if isVarRef(lhs, info.containerScope, info.posVar) then
                 handledPos = true
-                if rhs.kind == AstKind.IndexExpression
-                    and isVarRef(rhs.base, info.containerScope, info.currentEnvVar) then
+                local rhsRk = regKeyOfNode(rhs, info)
+                local rhsVk = varNodeKey(rhs)
+                if rhs.kind == AstKind.NilExpression
+                    or (rhs.kind == AstKind.IndexExpression and isCurrentEnvExpr(rhs.base))
+                    or (rhsRk and envLookupInReg[rhsRk]) then
                     term = { kind = "return" }
                     pendingPosAnd = nil
+                elseif rhsVk and branchInVar[rhsVk] then
+                    local br = branchInVar[rhsVk]
+                    removeBodyStmt(br.if2)
+                    removeBodyStmt(br.if1)
+                    removeBodyStmt(br.stmt)
+                    removeBodyStmt(br.declStmt)
+                    local cPos = br.condPos or #body
+                    if cPos > #body then cPos = #body end
+                    term = {
+                        kind = "branch",
+                        cond = br.cond,
+                        condPos = cPos,
+                        trueTarget = leafForId(br.tId),
+                        falseTarget = leafForId(br.fId),
+                    }
+                    pendingPosAnd = nil
+                    pendingPosCond = nil
+                elseif rhsVk and pendingAndInVar[rhsVk] then
+                    pendingPosAnd = pendingAndInVar[rhsVk]
+                    pendingPosCond = nil
                 elseif rhs.kind == AstKind.OrExpression then
-                    if rhs.lhs.kind == AstKind.AndExpression and rhs.lhs.rhs.kind == AstKind.NumberExpression
-                        and rhs.rhs.kind == AstKind.NumberExpression then
+                    local andT = rhs.lhs.kind == AstKind.AndExpression and evalNumOrReg(rhs.lhs.rhs) or nil
+                    local orF = evalNumOrReg(rhs.rhs)
+                    if andT and orF then
                         term = {
                             kind = "branch",
                             cond = rhs.lhs.lhs,
                             condPos = #body,
-                            trueTarget = leafForId(rhs.lhs.rhs.value),
-                            falseTarget = leafForId(rhs.rhs.value),
+                            trueTarget = leafForId(andT),
+                            falseTarget = leafForId(orF),
                         }
                         pendingPosAnd = nil
                     elseif isVarRef(rhs.lhs, info.containerScope, info.posVar) and pendingPosAnd then
@@ -512,34 +1006,260 @@ local function normalizeLeafStatements(rawStmts, info, leafForId)
                                 falseTarget = leafForId(fId),
                             }
                             pendingPosAnd = nil
+                            pendingPosCond = nil
+                        end
+                    elseif varNodeKey(rhs.lhs) and pendingAndInVar[varNodeKey(rhs.lhs)] then
+                        local pa = pendingAndInVar[varNodeKey(rhs.lhs)]
+                        local fId = evalNumOrReg(rhs.rhs)
+                        if fId then
+                            removeBodyStmt(pa.if1)
+                            removeBodyStmt(pa.stmt)
+                            local cPos = pa.condPos or #body
+                            if cPos > #body then cPos = #body end
+                            term = {
+                                kind = "branch",
+                                cond = pa.cond,
+                                condPos = cPos,
+                                trueTarget = leafForId(pa.tId),
+                                falseTarget = leafForId(fId),
+                            }
+                            pendingPosAnd = nil
+                            pendingPosCond = nil
                         end
                     end
                 elseif rhs.kind == AstKind.AndExpression then
                     local tId = evalNumOrReg(rhs.rhs)
                     if tId then
                         pendingPosAnd = { cond = rhs.lhs, condPos = #body, tId = tId }
+                        pendingPosCond = nil
                     end
                 else
                     local targetId = evalNumOrReg(rhs)
                     if targetId then
                         term = { kind = "goto", target = leafForId(targetId) }
                         pendingPosAnd = nil
+                        pendingPosCond = nil
+                    else
+                        pendingPosCond = { cond = rhs, condPos = #body }
                     end
                 end
             elseif isVarRef(rhs, info.containerScope, info.posVar) then
                 local rk = regKeyOfNode(lhs, info)
                 if rk then
                     constNumInReg[rk] = nil
+                    envLookupInReg[rk] = nil
+                    currentEnvAlias[rk] = nil
                     handledPos = true
                 end
             else
                 local rk = regKeyOfNode(lhs, info)
+                local dstVk = varNodeKey(lhs)
+                local srcVk = varNodeKey(rhs)
+                local srcRk = regKeyOfNode(rhs, info)
+                if dstVk then
+                    if rhs.kind == AstKind.AndExpression then
+                        local tVal = evalNumOrReg(rhs.rhs)
+                        if tVal then
+                            pendingAndInVar[dstVk] = {
+                                cond = rhs.lhs,
+                                condPos = #body,
+                                tId = tVal,
+                                if1 = s,
+                            }
+                            branchInVar[dstVk] = nil
+                        else
+                            pendingAndInVar[dstVk] = nil
+                            branchInVar[dstVk] = nil
+                        end
+                    elseif rhs.kind == AstKind.OrExpression then
+                        local fVal = evalNumOrReg(rhs.rhs)
+                        local lhsVk = varNodeKey(rhs.lhs)
+                        local pa = lhsVk and pendingAndInVar[lhsVk] or nil
+                        if rhs.lhs.kind == AstKind.AndExpression then
+                            local tVal = evalNumOrReg(rhs.lhs.rhs)
+                            if tVal and fVal then
+                                branchInVar[dstVk] = {
+                                    cond = rhs.lhs.lhs,
+                                    condPos = #body,
+                                    tId = tVal,
+                                    fId = fVal,
+                                    if2 = s,
+                                }
+                                pendingAndInVar[dstVk] = nil
+                            else
+                                pendingAndInVar[dstVk] = nil
+                                branchInVar[dstVk] = nil
+                            end
+                        elseif pa and fVal then
+                            branchInVar[dstVk] = {
+                                cond = pa.cond,
+                                condPos = pa.condPos,
+                                tId = pa.tId,
+                                fId = fVal,
+                                if1 = pa.if1,
+                                if2 = s,
+                            }
+                            if dstVk ~= lhsVk then
+                                pendingAndInVar[dstVk] = nil
+                            else
+                                pendingAndInVar[dstVk] = nil
+                            end
+                        else
+                            pendingAndInVar[dstVk] = nil
+                            branchInVar[dstVk] = nil
+                        end
+                    elseif srcVk and srcVk ~= dstVk then
+                        pendingAndInVar[dstVk] = pendingAndInVar[srcVk]
+                        branchInVar[dstVk] = branchInVar[srcVk]
+                    elseif not srcVk then
+                        pendingAndInVar[dstVk] = nil
+                        branchInVar[dstVk] = nil
+                    end
+                end
                 if rk then
                     if rhs.kind == AstKind.NumberExpression then
                         constNumInReg[rk] = rhs.value
+                        envLookupInReg[rk] = nil
+                        currentEnvAlias[rk] = nil
+                    elseif srcRk and constNumInReg[srcRk] ~= nil then
+                        constNumInReg[rk] = constNumInReg[srcRk]
+                        envLookupInReg[rk] = nil
+                        currentEnvAlias[rk] = nil
+                    elseif isCurrentEnvExpr(rhs) or (srcRk and currentEnvAlias[srcRk]) then
+                        constNumInReg[rk] = nil
+                        envLookupInReg[rk] = nil
+                        currentEnvAlias[rk] = true
+                    elseif (rhs.kind == AstKind.IndexExpression and isCurrentEnvExpr(rhs.base))
+                        or (srcRk and envLookupInReg[srcRk]) then
+                        constNumInReg[rk] = nil
+                        envLookupInReg[rk] = true
+                        currentEnvAlias[rk] = nil
                     else
                         constNumInReg[rk] = nil
+                        envLookupInReg[rk] = nil
+                        currentEnvAlias[rk] = nil
                     end
+                end
+            end
+        elseif s.kind == AstKind.IfStatement and #s.elseifs == 0 and not s.elsebody then
+            local posTarget = evalSingleBranchPosTarget(s.body)
+            if posTarget and isVarRef(s.condition, info.containerScope, info.posVar) and pendingPosCond then
+                handledPos = true
+                pendingPosAnd = {
+                    cond = pendingPosCond.cond,
+                    condPos = pendingPosCond.condPos,
+                    tId = posTarget,
+                }
+                pendingPosCond = nil
+            elseif posTarget and s.condition.kind == AstKind.NotExpression
+                and isVarRef(s.condition.rhs, info.containerScope, info.posVar) and pendingPosAnd then
+                handledPos = true
+                local cPos = pendingPosAnd.condPos or #body
+                if cPos > #body then cPos = #body end
+                term = {
+                    kind = "branch",
+                    cond = pendingPosAnd.cond,
+                    condPos = cPos,
+                    trueTarget = leafForId(pendingPosAnd.tId),
+                    falseTarget = leafForId(posTarget),
+                }
+                pendingPosAnd = nil
+                pendingPosCond = nil
+            else
+                local targetVk, targetVal = evalSingleBranchIfTarget(s.body)
+                if targetVk and targetVal then
+                    if s.condition.kind == AstKind.NotExpression then
+                        local innerVk = varNodeKey(s.condition.rhs)
+                        local pa = innerVk and pendingAndInVar[innerVk] or nil
+                        if pa and innerVk == targetVk then
+                            branchInVar[targetVk] = {
+                                cond = pa.cond,
+                                condPos = pa.condPos,
+                                tId = pa.tId,
+                                fId = targetVal,
+                                if1 = pa.if1,
+                                if2 = s,
+                            }
+                            pendingAndInVar[targetVk] = nil
+                        elseif isVarRef(s.condition.rhs, info.containerScope, info.posVar) and pendingPosAnd then
+                            branchInVar[targetVk] = {
+                                cond = pendingPosAnd.cond,
+                                condPos = pendingPosAnd.condPos,
+                                tId = pendingPosAnd.tId,
+                                fId = targetVal,
+                                if1 = pendingPosAnd.if1,
+                                if2 = s,
+                            }
+                            pendingPosAnd = nil
+                            pendingPosCond = nil
+                        else
+                            pendingAndInVar[targetVk] = {
+                                cond = s.condition,
+                                condPos = #body,
+                                tId = targetVal,
+                                if1 = s,
+                            }
+                        end
+                    else
+                        pendingAndInVar[targetVk] = {
+                            cond = s.condition,
+                            condPos = #body,
+                            tId = targetVal,
+                            if1 = s,
+                        }
+                    end
+                else
+                    visitSub(s, function(n)
+                        if n.kind == AstKind.AssignmentStatement then
+                            for _, l in ipairs(n.lhs) do
+                                local rk = regKeyOfNode(l, info)
+                                if rk then constNumInReg[rk] = nil end
+                                local vk = varNodeKey(l)
+                                if vk then
+                                    pendingAndInVar[vk] = nil
+                                    branchInVar[vk] = nil
+                                end
+                            end
+                        end
+                    end, nil, info.globalScope)
+                end
+            end
+        elseif s.kind == AstKind.IfStatement and #s.elseifs == 0 and s.elsebody
+            and #s.body.statements == 1 and #s.elsebody.statements == 1
+            and s.body.statements[1].kind == AstKind.AssignmentStatement
+            and s.elsebody.statements[1].kind == AstKind.AssignmentStatement
+            and #s.body.statements[1].lhs == 1 and #s.elsebody.statements[1].lhs == 1 then
+            local a1, a2 = s.body.statements[1], s.elsebody.statements[1]
+            local tVal, fVal = evalNumOrReg(a1.rhs[1]), evalNumOrReg(a2.rhs[1])
+            if tVal and fVal then
+                if isVarRef(a1.lhs[1], info.containerScope, info.posVar)
+                    and isVarRef(a2.lhs[1], info.containerScope, info.posVar) then
+                    handledPos = true
+                    term = {
+                        kind = "branch",
+                        cond = s.condition,
+                        condPos = #body,
+                        trueTarget = leafForId(tVal),
+                        falseTarget = leafForId(fVal),
+                    }
+                elseif a1.lhs[1].kind == AstKind.AssignmentVariable and a2.lhs[1].kind == AstKind.AssignmentVariable
+                    and a1.lhs[1].scope == a2.lhs[1].scope and a1.lhs[1].id == a2.lhs[1].id then
+                    local vk = tostring(a1.lhs[1].scope) .. ":" .. tostring(a1.lhs[1].id)
+                    local prevDeclPos, prevDeclStmt = nil, nil
+                    if #body >= 1 and body[#body].kind == AstKind.LocalVariableDeclaration
+                        and #body[#body].ids == 1 and #(body[#body].expressions or {}) == 0
+                        and body[#body].scope == a1.lhs[1].scope and body[#body].ids[1] == a1.lhs[1].id then
+                        prevDeclPos, prevDeclStmt = #body, body[#body]
+                    end
+                    branchInVar[vk] = {
+                        cond = s.condition,
+                        tId = tVal,
+                        fId = fVal,
+                        stmtPos = #body + 1,
+                        stmt = s,
+                        declPos = prevDeclPos,
+                        declStmt = prevDeclStmt,
+                    }
                 end
             end
         else
@@ -827,7 +1547,7 @@ local function liftContainer(block, info, targetLuaVersion)
         return normBlocks[idx]
     end
 
-    local topParentScope = block.scope.parentScope or info.globalScope
+    local topParentScope = block.scope or info.globalScope
     local holderScope = Scope:new(topParentScope)
     local helperVars = {}
     local function getHelperVar(kindName)
@@ -950,24 +1670,69 @@ local function liftContainer(block, info, targetLuaVersion)
         local maxArgIndex = 0
         local varargStartIdx = nil
 
+        local entryNums = {}
+        local function evalEntryNum(e)
+            if not e then return nil end
+            if e.kind == AstKind.NumberExpression then return e.value end
+            local erk = regKeyOfNode(e, info)
+            if erk and entryNums[erk] ~= nil then return entryNums[erk] end
+            return nil
+        end
+
         for _, s in ipairs(entryNb.rawStmts) do
             if s.kind == AstKind.AssignmentStatement and #s.lhs == 1 and #s.rhs == 1 then
                 local lk = regKeyOfNode(s.lhs[1], info)
                 local rhs = s.rhs[1]
+                if lk then
+                    if rhs.kind == AstKind.NumberExpression then
+                        entryNums[lk] = rhs.value
+                    else
+                        local rrk = regKeyOfNode(rhs, info)
+                        entryNums[lk] = rrk and entryNums[rrk] or nil
+                    end
+                end
                 if isTopLevel and lk and isVarRef(rhs, info.containerScope, info.argsVar) then
                     varargRegKey = lk
                 elseif not isTopLevel then
-                    if rhs.kind == AstKind.IndexExpression
-                        and isVarRef(rhs.base, info.containerScope, info.argsVar)
-                        and rhs.index.kind == AstKind.NumberExpression then
-                        if rhs.index.value > maxArgIndex then maxArgIndex = rhs.index.value end
-                    elseif lk and rhs.kind == AstKind.FunctionCallExpression
-                        and isVarRef(rhs.base, info.cffScope, info.packVar)
+                    if lk and rhs.kind == AstKind.FunctionCallExpression
+                        and rhs.base.kind == AstKind.VariableExpression and rhs.base.scope == info.cffScope
+                        and ((info.cffAliases[rhs.base.id] or rhs.base.id) == (info.cffAliases[info.packVar] or info.packVar))
                         and #rhs.args == 1 and rhs.args[1].kind == AstKind.FunctionCallExpression
-                        and isVarRef(rhs.args[1].base, info.cffScope, info.selectVar)
-                        and #rhs.args[1].args >= 1 and rhs.args[1].args[1].kind == AstKind.NumberExpression then
-                        varargRegKey = lk
-                        varargStartIdx = rhs.args[1].args[1].value
+                        and rhs.args[1].base.kind == AstKind.VariableExpression and rhs.args[1].base.scope == info.cffScope
+                        and ((info.cffAliases[rhs.args[1].base.id] or rhs.args[1].base.id) == (info.cffAliases[info.selectVar] or info.selectVar))
+                        and #rhs.args[1].args >= 1 then
+                        local sIdx = evalEntryNum(rhs.args[1].args[1])
+                        if sIdx then
+                            varargRegKey = lk
+                            varargStartIdx = sIdx
+                        end
+                    end
+                end
+            end
+            if not isTopLevel then
+                visitSub(s, function(n)
+                    if n.kind == AstKind.FunctionLiteralExpression then return nil, true end
+                    if n.kind == AstKind.IndexExpression
+                        and isVarRef(n.base, info.containerScope, info.argsVar) then
+                        local aIdx = evalEntryNum(n.index)
+                        if aIdx and aIdx > maxArgIndex then maxArgIndex = aIdx end
+                    end
+                end, nil, info.globalScope)
+            end
+        end
+        if not isTopLevel then
+            for _, bIdx in ipairs(funcNodes) do
+                if bIdx ~= entryIdx then
+                    local nb = getNormBlock(bIdx)
+                    for _, s in ipairs(nb.rawStmts) do
+                        visitSub(s, function(n)
+                            if n.kind == AstKind.FunctionLiteralExpression then return nil, true end
+                            if n.kind == AstKind.IndexExpression
+                                and isVarRef(n.base, info.containerScope, info.argsVar)
+                                and n.index.kind == AstKind.NumberExpression then
+                                if n.index.value > maxArgIndex then maxArgIndex = n.index.value end
+                            end
+                        end, nil, info.globalScope)
                     end
                 end
             end
@@ -1085,6 +1850,20 @@ local function liftContainer(block, info, targetLuaVersion)
                         writtenInBlock[rk] = true
                         everWritten[rk] = true
                     end
+                elseif s.kind == AstKind.IfStatement then
+                    noteReads(s)
+                    visitSub(s, function(n)
+                        if n.kind == AstKind.FunctionLiteralExpression then return nil, true end
+                        if n.kind == AstKind.AssignmentStatement then
+                            for _, l in ipairs(n.lhs) do
+                                local rk = regKeyOfNode(l, info)
+                                if rk and rk ~= varargRegKey then
+                                    everWritten[rk] = true
+                                    upwardExposed[rk] = true
+                                end
+                            end
+                        end
+                    end, nil, info.globalScope)
                 else
                     noteReads(s)
                 end
@@ -1094,6 +1873,46 @@ local function liftContainer(block, info, targetLuaVersion)
             end
             if nb.term.kind == "branch" and (not nb.term.condPos or nb.term.condPos > #nb.rawStmts) then
                 noteReads(nb.term.cond)
+            end
+        end
+
+        local uniqueConstNumByReg = {}
+        do
+            local poisoned = {}
+            for _, bIdx in ipairs(funcNodes) do
+                local nb = getNormBlock(bIdx)
+                for _, s in ipairs(nb.rawStmts) do
+                    visitSub(s, function(n)
+                        if n.kind == AstKind.FunctionLiteralExpression then return nil, true end
+                        if n.kind == AstKind.AssignmentStatement then
+                            for i = 1, #n.lhs do
+                                local rk = regKeyOfNode(n.lhs[i], info)
+                                local r = n.rhs[i]
+                                if rk then
+                                    if r and r.kind == AstKind.NumberExpression then
+                                        if not poisoned[rk] then
+                                            if uniqueConstNumByReg[rk] == nil or uniqueConstNumByReg[rk] == r.value then
+                                                uniqueConstNumByReg[rk] = r.value
+                                            else
+                                                uniqueConstNumByReg[rk] = nil
+                                                poisoned[rk] = true
+                                            end
+                                        end
+                                    elseif not (r and r.kind == AstKind.NilExpression) then
+                                        uniqueConstNumByReg[rk] = nil
+                                        poisoned[rk] = true
+                                    end
+                                end
+                            end
+                        elseif COMPOUND_CONSTRUCTORS[n.kind] then
+                            local rk = regKeyOfNode(n.lhs, info)
+                            if rk then
+                                uniqueConstNumByReg[rk] = nil
+                                poisoned[rk] = true
+                            end
+                        end
+                    end, nil, info.globalScope)
+                end
             end
         end
 
@@ -1201,6 +2020,39 @@ local function liftContainer(block, info, targetLuaVersion)
                 return exprList
             end
 
+            local constNumInReg = {}
+            local upvalAliasInReg = {}
+            local tableInReg = {}
+
+            local function evalCapTable(tExpr)
+                if not tExpr then return nil end
+                if tExpr.kind == AstKind.TableConstructorExpression then
+                    return tExpr
+                end
+                local trk = regKeyOfNode(tExpr, info)
+                if trk and tableInReg[trk] then
+                    return tableInReg[trk]
+                end
+                return nil
+            end
+
+            local function evalIndexNum(idxExpr)
+                if not idxExpr then return nil end
+                if idxExpr.kind == AstKind.NumberExpression then
+                    return idxExpr.value
+                end
+                local irk = regKeyOfNode(idxExpr, info)
+                if irk then
+                    if constNumInReg[irk] ~= nil then
+                        return constNumInReg[irk]
+                    end
+                    if uniqueConstNumByReg and uniqueConstNumByReg[irk] ~= nil then
+                        return uniqueConstNumByReg[irk]
+                    end
+                end
+                return nil
+            end
+
             local function resolveCaptureEntry(capExpr)
                 if capExpr.kind == AstKind.FunctionCallExpression
                     and isVarRef(capExpr.base, info.cffScope, info.allocUpvalFunction) then
@@ -1208,13 +2060,17 @@ local function liftContainer(block, info, targetLuaVersion)
                     emitPreStmt(Ast.LocalVariableDeclaration(funcScope, { cid }, { Ast.TableConstructorExpression({}) }))
                     return { scope = funcScope, id = cid }
                 elseif capExpr.kind == AstKind.IndexExpression
-                    and isVarRef(capExpr.base, info.containerScope, info.currentUpvaluesVar)
-                    and capExpr.index.kind == AstKind.NumberExpression then
-                    local u = capExpr.index.value
-                    return parentUpvals[u]
+                    and isVarRef(capExpr.base, info.containerScope, info.currentUpvaluesVar) then
+                    local u = evalIndexNum(capExpr.index)
+                    if u then
+                        return parentUpvals[u]
+                    end
                 else
                     local rk = regKeyOfNode(capExpr, info)
                     if rk then
+                        if upvalAliasInReg[rk] then
+                            return upvalAliasInReg[rk]
+                        end
                         local snapId = funcScope:addVariable()
                         emitPreStmt(Ast.LocalVariableDeclaration(funcScope, { snapId }, { makeRegExpr(rk, funcScope) }))
                         return { scope = funcScope, id = snapId }
@@ -1226,15 +2082,85 @@ local function liftContainer(block, info, targetLuaVersion)
             end
 
             local rewriteExpr
+            local aliasInReg = {}
+            local leafLocalIds = {}
+
+            local function derefCffVar(node)
+                if not node then return nil end
+                local rk = regKeyOfNode(node, info)
+                if rk and aliasInReg[rk] then
+                    node = aliasInReg[rk]
+                end
+                if node.kind == AstKind.VariableExpression and node.scope == info.cffScope
+                    and info.cffAliases and info.cffAliases[node.id] then
+                    return Ast.VariableExpression(info.cffScope, info.cffAliases[node.id])
+                end
+                return node
+            end
+
+            local function isEnvNode(node)
+                local d = derefCffVar(node)
+                if not d then return false end
+                if isVarRef(d, info.containerScope, info.currentEnvVar) then return true end
+                if info.envVar and isVarRef(d, info.cffScope, info.envVar) then return true end
+                return false
+            end
+
+            local function isCffHelper(node, helperId)
+                if not helperId then return false end
+                local d = derefCffVar(node)
+                if not d or d.scope ~= info.cffScope then return false end
+                local canonHelper = (info.cffAliases and info.cffAliases[helperId]) or helperId
+                local canonNode = (info.cffAliases and info.cffAliases[d.id]) or d.id
+                return canonNode == canonHelper
+            end
+
+            resolveCaptureEntry = function(capExpr)
+                if capExpr.kind == AstKind.FunctionCallExpression
+                    and isCffHelper(capExpr.base, info.allocUpvalFunction) then
+                    local cid = funcScope:addVariable()
+                    emitPreStmt(Ast.LocalVariableDeclaration(funcScope, { cid }, { Ast.TableConstructorExpression({}) }))
+                    return { scope = funcScope, id = cid }
+                elseif capExpr.kind == AstKind.IndexExpression
+                    and isVarRef(capExpr.base, info.containerScope, info.currentUpvaluesVar) then
+                    local u = evalIndexNum(capExpr.index)
+                    if u then
+                        return parentUpvals[u]
+                    end
+                else
+                    local rk = regKeyOfNode(capExpr, info)
+                    if rk then
+                        if upvalAliasInReg[rk] then
+                            return upvalAliasInReg[rk]
+                        end
+                        local snapId = funcScope:addVariable()
+                        emitPreStmt(Ast.LocalVariableDeclaration(funcScope, { snapId }, { makeRegExpr(rk, funcScope) }))
+                        return { scope = funcScope, id = snapId }
+                    end
+                end
+                local fallbackId = funcScope:addVariable()
+                emitPreStmt(Ast.LocalVariableDeclaration(funcScope, { fallbackId }, { Ast.TableConstructorExpression({}) }))
+                return { scope = funcScope, id = fallbackId }
+            end
+
+            local function packedKeyOfNode(node)
+                local rk = regKeyOfNode(node, info)
+                if rk then return rk end
+                if node and node.kind == AstKind.VariableExpression and not node.scope.isGlobal then
+                    local lid = leafLocalIds[tostring(node.scope) .. ":" .. tostring(node.id)]
+                    if lid then return "ll_" .. tostring(lid) end
+                end
+                return nil
+            end
 
             local function rewriteArgList(rawArgs)
                 local out = {}
                 for i = 1, #rawArgs do
                     local a = rawArgs[i]
                     if i == #rawArgs and a.kind == AstKind.FunctionCallExpression
-                        and isVarRef(a.base, info.cffScope, info.unpackPackedVar) and #a.args == 1 then
+                        and isCffHelper(a.base, info.unpackPackedVar) and #a.args == 1 then
                         local inner = a.args[1]
-                        local irk = regKeyOfNode(inner, info)
+                        local irk = packedKeyOfNode(inner)
                         if irk and irk == varargRegKey then
                             out[#out + 1] = Ast.VarargExpression()
                         elseif irk and packedInBlock[irk] then
@@ -1261,6 +2187,11 @@ local function liftContainer(block, info, targetLuaVersion)
 
             rewriteExpr = function(expr)
                 if not expr then return Ast.NilExpression() end
+                if isEnvNode(expr) then
+                    local _, gid = info.globalScope:resolve("_G")
+                    funcScope:addReferenceToHigherScope(info.globalScope, gid)
+                    return Ast.VariableExpression(info.globalScope, gid)
+                end
                 local rk = regKeyOfNode(expr, info)
                 if rk then
                     if rk == varargRegKey then
@@ -1271,6 +2202,11 @@ local function liftContainer(block, info, targetLuaVersion)
                         local ve = Ast.VarargExpression()
                         ve.isParenthesizedExpression = true
                         return ve
+                    end
+                    if aliasInReg[rk] then
+                        local av = aliasInReg[rk]
+                        funcScope:addReferenceToHigherScope(av.scope, av.id)
+                        return Ast.VariableExpression(av.scope, av.id)
                     end
                     return makeRegExpr(rk, funcScope)
                 end
@@ -1290,30 +2226,41 @@ local function liftContainer(block, info, targetLuaVersion)
                 end
 
                 if k == AstKind.IndexExpression then
-                    if isVarRef(expr.base, info.containerScope, info.argsVar)
-                        and expr.index.kind == AstKind.NumberExpression then
-                        local idx = expr.index.value
-                        if paramIds[idx] then
-                            funcScope:addReferenceToHigherScope(funcScope, paramIds[idx])
-                            return Ast.VariableExpression(funcScope, paramIds[idx])
-                        end
-                        return Ast.NilExpression()
-                    end
-                    if varargRegKey and regKeyOfNode(expr.base, info) == varargRegKey
-                        and expr.index.kind == AstKind.NumberExpression then
-                        if expr.index.value == 1 and not varargTableVarId then
-                            local ve = Ast.VarargExpression()
-                            ve.isParenthesizedExpression = true
-                            return ve
-                        elseif varargTableVarId then
-                            funcScope:addReferenceToHigherScope(funcScope, varargTableVarId)
-                            return Ast.IndexExpression(
-                                Ast.VariableExpression(funcScope, varargTableVarId),
-                                Ast.NumberExpression(expr.index.value)
-                            )
+                    if isVarRef(expr.base, info.containerScope, info.currentUpvaluesVar) then
+                        local u = evalIndexNum(expr.index)
+                        local uv = u and parentUpvals[u] or nil
+                        if uv then
+                            funcScope:addReferenceToHigherScope(uv.scope, uv.id)
+                            return Ast.VariableExpression(uv.scope, uv.id)
                         end
                     end
-                    if isVarRef(expr.base, info.containerScope, info.currentEnvVar) then
+                    if isVarRef(expr.base, info.containerScope, info.argsVar) then
+                        local idx = evalIndexNum(expr.index)
+                        if idx then
+                            if paramIds[idx] then
+                                funcScope:addReferenceToHigherScope(funcScope, paramIds[idx])
+                                return Ast.VariableExpression(funcScope, paramIds[idx])
+                            end
+                            return Ast.NilExpression()
+                        end
+                    end
+                    if varargRegKey and regKeyOfNode(expr.base, info) == varargRegKey then
+                        local idx = evalIndexNum(expr.index)
+                        if idx then
+                            if idx == 1 and not varargTableVarId then
+                                local ve = Ast.VarargExpression()
+                                ve.isParenthesizedExpression = true
+                                return ve
+                            elseif varargTableVarId then
+                                funcScope:addReferenceToHigherScope(funcScope, varargTableVarId)
+                                return Ast.IndexExpression(
+                                    Ast.VariableExpression(funcScope, varargTableVarId),
+                                    Ast.NumberExpression(idx)
+                                )
+                            end
+                        end
+                    end
+                    if isEnvNode(expr.base) then
                         local idxRk = regKeyOfNode(expr.index, info)
                         if idxRk and constStrInReg[idxRk] ~= nil then
                             local _, gid = info.globalScope:resolve(constStrInReg[idxRk])
@@ -1330,12 +2277,11 @@ local function liftContainer(block, info, targetLuaVersion)
                         funcScope:addReferenceToHigherScope(info.globalScope, gid)
                         return Ast.IndexExpression(Ast.VariableExpression(info.globalScope, gid), idx)
                     end
-                    if isVarRef(expr.base, info.cffScope, info.upvaluesTable) then
+                    if isCffHelper(expr.base, info.upvaluesTable) then
                         if expr.index.kind == AstKind.IndexExpression
-                            and isVarRef(expr.index.base, info.containerScope, info.currentUpvaluesVar)
-                            and expr.index.index.kind == AstKind.NumberExpression then
-                            local u = expr.index.index.value
-                            local uv = parentUpvals[u]
+                            and isVarRef(expr.index.base, info.containerScope, info.currentUpvaluesVar) then
+                            local u = evalIndexNum(expr.index.index)
+                            local uv = u and parentUpvals[u] or nil
                             if uv then
                                 funcScope:addReferenceToHigherScope(uv.scope, uv.id)
                                 return Ast.IndexExpression(Ast.VariableExpression(uv.scope, uv.id), Ast.NumberExpression(1))
@@ -1347,59 +2293,66 @@ local function liftContainer(block, info, targetLuaVersion)
                 end
 
                 if k == AstKind.FunctionCallExpression then
-                    if isVarRef(expr.base, info.cffScope, info.allocUpvalFunction) then
+                    if isCffHelper(expr.base, info.allocUpvalFunction) then
                         return Ast.TableConstructorExpression({})
                     end
-                    if info.freeUpvalueFunc and isVarRef(expr.base, info.cffScope, info.freeUpvalueFunc) then
+                    if isCffHelper(expr.base, info.freeUpvalueFunc) then
                         return Ast.NilExpression()
                     end
-                    if isVarRef(expr.base, info.cffScope, info.callFunctionVar) and #expr.args >= 2 then
+                    if isCffHelper(expr.base, info.callFunctionVar) and #expr.args >= 2 then
                         local fnExpr = rewriteExpr(expr.args[1])
                         local rawCallArgs = {}
                         for i = 3, #expr.args do rawCallArgs[#rawCallArgs + 1] = expr.args[i] end
                         return Ast.FunctionCallExpression(fnExpr, rewriteArgList(rawCallArgs))
                     end
-                    if isVarRef(expr.base, info.cffScope, info.createVarargClosureVar)
-                        and #expr.args >= 2 and expr.args[1].kind == AstKind.NumberExpression
-                        and expr.args[2].kind == AstKind.TableConstructorExpression then
-                        local childCaps = {}
-                        for i, ent in ipairs(expr.args[2].entries) do
-                            childCaps[i] = resolveCaptureEntry(ent.value)
+                    if isCffHelper(expr.base, info.createVarargClosureVar)
+                        and #expr.args >= 2 then
+                        local cEntry = evalIndexNum(expr.args[1])
+                        local cTbl = evalCapTable(expr.args[2])
+                        if cEntry and cTbl then
+                            local childCaps = {}
+                            for i, ent in ipairs(cTbl.entries) do
+                                childCaps[i] = resolveCaptureEntry(ent.value)
+                            end
+                            return liftClosure(cEntry, false, true, childCaps, funcScope)
                         end
-                        return liftClosure(expr.args[1].value, false, true, childCaps, funcScope)
                     end
-                    if expr.base.kind == AstKind.VariableExpression and expr.base.scope == info.cffScope
-                        and info.createClosureArity[expr.base.id] ~= nil
-                        and #expr.args >= 2 and expr.args[1].kind == AstKind.NumberExpression
-                        and expr.args[2].kind == AstKind.TableConstructorExpression then
-                        local childCaps = {}
-                        for i, ent in ipairs(expr.args[2].entries) do
-                            childCaps[i] = resolveCaptureEntry(ent.value)
+                    local dBase = derefCffVar(expr.base)
+                    if dBase and dBase.kind == AstKind.VariableExpression and dBase.scope == info.cffScope
+                        and info.createClosureArity[dBase.id] ~= nil
+                        and #expr.args >= 2 then
+                        local cEntry = evalIndexNum(expr.args[1])
+                        local cTbl = evalCapTable(expr.args[2])
+                        if cEntry and cTbl then
+                            local childCaps = {}
+                            for i, ent in ipairs(cTbl.entries) do
+                                childCaps[i] = resolveCaptureEntry(ent.value)
+                            end
+                            return liftClosure(cEntry, false, false, childCaps, funcScope)
                         end
-                        return liftClosure(expr.args[1].value, false, false, childCaps, funcScope)
                     end
                     if expr.base.kind == AstKind.FunctionLiteralExpression and #expr.args == 3
-                        and isVarRef(expr.args[2], info.containerScope, info.currentEnvVar)
-                        and isVarRef(expr.args[3], info.cffScope, info.upvaluesTable) then
+                        and isEnvNode(expr.args[2])
+                        and isCffHelper(expr.args[3], info.upvaluesTable) then
                         local unwrapped = unwrapNativeCall(expr.base, expr.args[1], resolveCaptureEntry, funcScope)
                         if unwrapped then return unwrapped end
                     end
-                    if isVarRef(expr.base, info.cffScope, info.tonumberVar) then
+                    if isCffHelper(expr.base, info.tonumberVar) then
                         local tnId = getHelperVar("tonumber")
                         funcScope:addReferenceToHigherScope(holderScope, tnId)
                         return Ast.FunctionCallExpression(Ast.VariableExpression(holderScope, tnId), rewriteArgList(expr.args))
                     end
-                    if isVarRef(expr.base, info.cffScope, info.errorVar) then
+                    if isCffHelper(expr.base, info.errorVar) then
                         local erId = getHelperVar("error")
                         funcScope:addReferenceToHigherScope(holderScope, erId)
                         return Ast.FunctionCallExpression(Ast.VariableExpression(holderScope, erId), rewriteArgList(expr.args))
                     end
-                    if isVarRef(expr.base, info.cffScope, info.selectVar) then
+                    if isCffHelper(expr.base, info.selectVar) then
                         local slId = getHelperVar("select")
                         funcScope:addReferenceToHigherScope(holderScope, slId)
                         return Ast.FunctionCallExpression(Ast.VariableExpression(holderScope, slId), rewriteArgList(expr.args))
                     end
-                    if isVarRef(expr.base, info.cffScope, info.packVar) then
+                    if isCffHelper(expr.base, info.packVar) then
                         local vals = rewriteArgList(expr.args)
                         local pkId = getHelperVar("pack")
                         funcScope:addReferenceToHigherScope(holderScope, pkId)
@@ -1417,7 +2370,7 @@ local function liftContainer(block, info, targetLuaVersion)
                     for idxE, ent in ipairs(expr.entries) do
                         if ent.kind == AstKind.TableEntry then
                             if idxE == #expr.entries and ent.value.kind == AstKind.FunctionCallExpression
-                                and isVarRef(ent.value.base, info.cffScope, info.unpackPackedVar) then
+                                and isCffHelper(ent.value.base, info.unpackPackedVar) then
                                 local tail = rewriteArgList({ ent.value })
                                 for _, te in ipairs(tail) do entries[#entries + 1] = Ast.TableEntry(te) end
                             else
@@ -1451,12 +2404,17 @@ local function liftContainer(block, info, targetLuaVersion)
                 end
 
                 if k == AstKind.VariableExpression then
-                    if isVarRef(expr, info.containerScope, info.currentEnvVar) then
+                    if isEnvNode(expr) then
                         local _, gid = info.globalScope:resolve("_G")
                         funcScope:addReferenceToHigherScope(info.globalScope, gid)
                         return Ast.VariableExpression(info.globalScope, gid)
                     end
                     if not expr.scope.isGlobal then
+                        local lid = leafLocalIds[tostring(expr.scope) .. ":" .. tostring(expr.id)]
+                        if lid then
+                            funcScope:addReferenceToHigherScope(funcScope, lid)
+                            return Ast.VariableExpression(funcScope, lid)
+                        end
                         funcScope:addReferenceToHigherScope(expr.scope, expr.id)
                     else
                         funcScope:addReferenceToHigherScope(info.globalScope, expr.id)
@@ -1473,7 +2431,7 @@ local function liftContainer(block, info, targetLuaVersion)
                     return makeRegLhs(rk, funcScope)
                 end
                 if lhs.kind == AstKind.AssignmentIndexing then
-                    if isVarRef(lhs.base, info.containerScope, info.currentEnvVar) then
+                    if isEnvNode(lhs.base) then
                         local idxRk = regKeyOfNode(lhs.index, info)
                         if idxRk and constStrInReg[idxRk] ~= nil then
                             local _, gid = info.globalScope:resolve(constStrInReg[idxRk])
@@ -1490,11 +2448,11 @@ local function liftContainer(block, info, targetLuaVersion)
                         funcScope:addReferenceToHigherScope(info.globalScope, gid)
                         return Ast.AssignmentIndexing(Ast.VariableExpression(info.globalScope, gid), idx)
                     end
-                    if isVarRef(lhs.base, info.cffScope, info.upvaluesTable) then
+                    if isCffHelper(lhs.base, info.upvaluesTable) then
                         if lhs.index.kind == AstKind.IndexExpression
-                            and isVarRef(lhs.index.base, info.containerScope, info.currentUpvaluesVar)
-                            and lhs.index.index.kind == AstKind.NumberExpression then
-                            local uv = parentUpvals[lhs.index.index.value]
+                            and isVarRef(lhs.index.base, info.containerScope, info.currentUpvaluesVar) then
+                            local u = evalIndexNum(lhs.index.index)
+                            local uv = u and parentUpvals[u] or nil
                             if uv then
                                 funcScope:addReferenceToHigherScope(uv.scope, uv.id)
                                 return Ast.AssignmentIndexing(Ast.VariableExpression(uv.scope, uv.id), Ast.NumberExpression(1))
@@ -1505,6 +2463,11 @@ local function liftContainer(block, info, targetLuaVersion)
                     return Ast.AssignmentIndexing(rewriteExpr(lhs.base), rewriteExpr(lhs.index))
                 end
                 if lhs.kind == AstKind.AssignmentVariable then
+                    local lid = leafLocalIds[tostring(lhs.scope) .. ":" .. tostring(lhs.id)]
+                    if lid then
+                        funcScope:addReferenceToHigherScope(funcScope, lid)
+                        return Ast.AssignmentVariable(funcScope, lid)
+                    end
                     funcScope:addReferenceToHigherScope(lhs.scope, lhs.id)
                     return Ast.AssignmentVariable(lhs.scope, lhs.id)
                 end
@@ -1520,15 +2483,29 @@ local function liftContainer(block, info, targetLuaVersion)
                 if s.kind == AstKind.AssignmentStatement and #s.lhs == 1 and #s.rhs == 1 then
                     local lhs, rhs = s.lhs[1], s.rhs[1]
                     local lk = regKeyOfNode(lhs, info)
+                    local rhsCffTarget = nil
+                    if rhs.kind == AstKind.VariableExpression then
+                        local dRhs = derefCffVar(rhs)
+                        if dRhs and (dRhs.scope == info.cffScope or isVarRef(dRhs, info.containerScope, info.currentEnvVar)) then
+                            rhsCffTarget = dRhs
+                        end
+                    end
                     if isVarRef(lhs, info.containerScope, info.returnVar) then
                         if rhs.kind == AstKind.FunctionCallExpression
-                            and isVarRef(rhs.base, info.cffScope, info.packVar) then
+                            and isCffHelper(rhs.base, info.packVar) then
                             blockReturnArgs = snapshotExprListAtNow(rewriteArgList(rhs.args))
                         else
                             blockReturnArgs = snapshotExprListAtNow({ rewriteExpr(rhs) })
                         end
+                    elseif lk and rhsCffTarget then
+                        constStrInReg[lk] = nil
+                        constNumInReg[lk] = nil
+                        packedInBlock[lk] = nil
+                        aliasInReg[lk] = rhsCffTarget
                     elseif lk and lk == varargRegKey and bIdx == entryIdx then
                         constStrInReg[lk] = nil
+                        constNumInReg[lk] = nil
+                        aliasInReg[lk] = nil
                         if varargTableVarId then
                             funcScope:addReferenceToHigherScope(funcScope, varargTableVarId)
                             curStmts[#curStmts + 1] = Ast.AssignmentStatement(
@@ -1537,9 +2514,11 @@ local function liftContainer(block, info, targetLuaVersion)
                             )
                         end
                     elseif lk and rhs.kind == AstKind.FunctionCallExpression
-                        and isVarRef(rhs.base, info.cffScope, info.packVar)
+                        and isCffHelper(rhs.base, info.packVar)
                         and not upwardExposed[lk] then
                         constStrInReg[lk] = nil
+                        constNumInReg[lk] = nil
+                        aliasInReg[lk] = nil
                         local packedExprs = snapshotExprListAtNow(rewriteArgList(rhs.args))
                         if #rhs.args == 1 and rhs.args[1].kind ~= AstKind.FunctionCallExpression
                             and rhs.args[1].kind ~= AstKind.PassSelfFunctionCallExpression
@@ -1550,12 +2529,39 @@ local function liftContainer(block, info, targetLuaVersion)
                         packedInBlock[lk] = { exprs = packedExprs }
                     elseif lk and rhs.kind == AstKind.NilExpression and packedInBlock[lk] then
                         constStrInReg[lk] = nil
+                        constNumInReg[lk] = nil
+                        aliasInReg[lk] = nil
                         packedInBlock[lk] = nil
                     elseif lk and not everRead[lk] then
+                        local rhsRk = regKeyOfNode(rhs, info)
+                        aliasInReg[lk] = rhsRk and aliasInReg[rhsRk] or nil
+                        if rhs.kind == AstKind.IndexExpression
+                            and isVarRef(rhs.base, info.containerScope, info.currentUpvaluesVar) then
+                            local u = evalIndexNum(rhs.index)
+                            upvalAliasInReg[lk] = u and parentUpvals[u] or nil
+                        else
+                            upvalAliasInReg[lk] = rhsRk and upvalAliasInReg[rhsRk] or nil
+                        end
                         if rhs.kind == AstKind.StringExpression then
                             constStrInReg[lk] = rhs.value
+                            constNumInReg[lk] = nil
+                            tableInReg[lk] = nil
+                        elseif rhs.kind == AstKind.NumberExpression then
+                            constNumInReg[lk] = rhs.value
+                            constStrInReg[lk] = nil
+                            tableInReg[lk] = nil
+                        elseif rhs.kind == AstKind.TableConstructorExpression then
+                            tableInReg[lk] = rhs
+                            constStrInReg[lk] = nil
+                            constNumInReg[lk] = nil
+                        elseif rhsRk then
+                            constStrInReg[lk] = constStrInReg[rhsRk]
+                            constNumInReg[lk] = constNumInReg[rhsRk]
+                            tableInReg[lk] = tableInReg[rhsRk]
                         else
                             constStrInReg[lk] = nil
+                            constNumInReg[lk] = nil
+                            tableInReg[lk] = nil
                         end
                         local rExpr = rewriteExpr(rhs)
                         if rExpr.kind == AstKind.FunctionCallExpression then
@@ -1567,24 +2573,95 @@ local function liftContainer(block, info, targetLuaVersion)
                             curStmts[#curStmts + 1] = Ast.LocalVariableDeclaration(funcScope, { tmpId }, { rExpr })
                         end
                     else
+                        local rhsRk = regKeyOfNode(rhs, info)
+                        local prevStr = rhsRk and constStrInReg[rhsRk] or nil
+                        local prevNum = rhsRk and constNumInReg[rhsRk] or nil
+                        local prevTbl = rhsRk and tableInReg[rhsRk] or nil
+                        local prevAlias = rhsRk and aliasInReg[rhsRk] or nil
+                        local prevUpval = nil
+                        if rhs.kind == AstKind.IndexExpression
+                            and isVarRef(rhs.base, info.containerScope, info.currentUpvaluesVar) then
+                            local u = evalIndexNum(rhs.index)
+                            prevUpval = u and parentUpvals[u] or nil
+                        elseif rhsRk then
+                            prevUpval = upvalAliasInReg[rhsRk]
+                        end
+                        if lk then
+                            aliasInReg[lk] = prevAlias
+                            upvalAliasInReg[lk] = prevUpval
+                            if rhs.kind == AstKind.TableConstructorExpression then
+                                tableInReg[lk] = rhs
+                            else
+                                tableInReg[lk] = prevTbl
+                            end
+                        end
                         local newLhs = rewriteLhs(lhs)
                         local newRhs = rewriteExpr(rhs)
                         if lk then
                             if rhs.kind == AstKind.StringExpression then
                                 constStrInReg[lk] = rhs.value
+                                constNumInReg[lk] = nil
+                            elseif rhs.kind == AstKind.NumberExpression then
+                                constNumInReg[lk] = rhs.value
+                                constStrInReg[lk] = nil
+                            elseif rhsRk then
+                                constStrInReg[lk] = prevStr
+                                constNumInReg[lk] = prevNum
                             else
                                 constStrInReg[lk] = nil
+                                constNumInReg[lk] = nil
                             end
                         end
                         curStmts[#curStmts + 1] = Ast.AssignmentStatement({ newLhs }, { newRhs })
                     end
+                elseif s.kind == AstKind.LocalVariableDeclaration then
+                    if #s.ids == 1 and s.expressions and #s.expressions == 1
+                        and s.expressions[1].kind == AstKind.FunctionCallExpression
+                        and isCffHelper(s.expressions[1].base, info.packVar) then
+                        local lid = funcScope:addVariable()
+                        leafLocalIds[tostring(s.scope) .. ":" .. tostring(s.ids[1])] = lid
+                        local rhs = s.expressions[1]
+                        local packedExprs = snapshotExprListAtNow(rewriteArgList(rhs.args))
+                        if #rhs.args == 1 and rhs.args[1].kind ~= AstKind.FunctionCallExpression
+                            and rhs.args[1].kind ~= AstKind.PassSelfFunctionCallExpression
+                            and rhs.args[1].kind ~= AstKind.VarargExpression
+                            and #packedExprs == 1 then
+                            packedExprs[1].isParenthesizedExpression = true
+                        end
+                        packedInBlock["ll_" .. tostring(lid)] = { exprs = packedExprs }
+                    else
+                        local newIds = {}
+                        local newExprs = {}
+                        for i = 1, #s.ids do
+                            local lid = funcScope:addVariable()
+                            leafLocalIds[tostring(s.scope) .. ":" .. tostring(s.ids[i])] = lid
+                            newIds[i] = lid
+                        end
+                        for i = 1, #(s.expressions or {}) do
+                            newExprs[i] = rewriteExpr(s.expressions[i])
+                        end
+                        curStmts[#curStmts + 1] = Ast.LocalVariableDeclaration(funcScope, newIds, newExprs)
+                    end
+                elseif s.kind == AstKind.FunctionCallStatement then
+                    local callExpr = rewriteExpr(Ast.FunctionCallExpression(s.base, s.args))
+                    if callExpr.kind == AstKind.FunctionCallExpression then
+                        curStmts[#curStmts + 1] = Ast.FunctionCallStatement(callExpr.base, callExpr.args)
+                    elseif callExpr.kind == AstKind.PassSelfFunctionCallExpression then
+                        curStmts[#curStmts + 1] = Ast.PassSelfFunctionCallStatement(callExpr.base, callExpr.passSelfFunctionName, callExpr.args)
+                    end
+                elseif s.kind == AstKind.PassSelfFunctionCallStatement then
+                    curStmts[#curStmts + 1] = Ast.PassSelfFunctionCallStatement(rewriteExpr(s.base), s.passSelfFunctionName, rewriteArgList(s.args))
                 elseif s.kind == AstKind.AssignmentStatement then
                     local nl, nr = {}, {}
                     for i = 1, #s.lhs do nl[i] = rewriteLhs(s.lhs[i]) end
                     for i = 1, #s.rhs do nr[i] = rewriteExpr(s.rhs[i]) end
                     for i = 1, #s.lhs do
                         local lk = regKeyOfNode(s.lhs[i], info)
-                        if lk then constStrInReg[lk] = nil end
+                        if lk then
+                            constStrInReg[lk] = nil
+                            constNumInReg[lk] = nil
+                            aliasInReg[lk] = nil
+                        end
                     end
                     curStmts[#curStmts + 1] = Ast.AssignmentStatement(nl, nr)
                 elseif COMPOUND_CONSTRUCTORS[s.kind] then
@@ -1622,6 +2699,65 @@ local function liftContainer(block, info, targetLuaVersion)
                     else
                         curStmts[#curStmts + 1] = COMPOUND_CONSTRUCTORS[s.kind](nl, nr)
                     end
+                elseif s.kind == AstKind.IfStatement then
+                    local function rewriteIfBlock(blk, parentSc)
+                        local subSc = Scope:new(parentSc)
+                        local subStmts = {}
+                        for _, bs in ipairs(blk.statements) do
+                            if bs.kind == AstKind.AssignmentStatement then
+                                local nl, nr = {}, {}
+                                for i = 1, #bs.lhs do nl[i] = rewriteLhs(bs.lhs[i]) end
+                                for i = 1, #bs.rhs do nr[i] = rewriteExpr(bs.rhs[i]) end
+                                for i = 1, #bs.lhs do
+                                    local lk = regKeyOfNode(bs.lhs[i], info)
+                                    if lk then
+                                        constStrInReg[lk] = nil
+                                        constNumInReg[lk] = nil
+                                        aliasInReg[lk] = nil
+                                        upvalAliasInReg[lk] = nil
+                                        tableInReg[lk] = nil
+                                        packedInBlock[lk] = nil
+                                    end
+                                end
+                                subStmts[#subStmts + 1] = Ast.AssignmentStatement(nl, nr)
+                            elseif bs.kind == AstKind.FunctionCallStatement then
+                                local ce = rewriteExpr(Ast.FunctionCallExpression(bs.base, bs.args))
+                                if ce.kind == AstKind.FunctionCallExpression then
+                                    subStmts[#subStmts + 1] = Ast.FunctionCallStatement(ce.base, ce.args)
+                                elseif ce.kind == AstKind.PassSelfFunctionCallExpression then
+                                    subStmts[#subStmts + 1] = Ast.PassSelfFunctionCallStatement(ce.base, ce.passSelfFunctionName, ce.args)
+                                end
+                            elseif bs.kind == AstKind.PassSelfFunctionCallStatement then
+                                subStmts[#subStmts + 1] = Ast.PassSelfFunctionCallStatement(rewriteExpr(bs.base), bs.passSelfFunctionName, rewriteArgList(bs.args))
+                            elseif bs.kind == AstKind.IfStatement then
+                                local subEifs = {}
+                                for _, ei in ipairs(bs.elseifs or {}) do
+                                    subEifs[#subEifs + 1] = {
+                                        condition = rewriteExpr(ei.condition),
+                                        body = rewriteIfBlock(ei.body, subSc),
+                                    }
+                                end
+                                subStmts[#subStmts + 1] = Ast.IfStatement(
+                                    rewriteExpr(bs.condition),
+                                    rewriteIfBlock(bs.body, subSc),
+                                    subEifs,
+                                    bs.elsebody and rewriteIfBlock(bs.elsebody, subSc) or nil
+                                )
+                            end
+                        end
+                        return Ast.Block(subStmts, subSc)
+                    end
+                    local newCond = rewriteExpr(s.condition)
+                    local newBody = rewriteIfBlock(s.body, funcScope)
+                    local newEifs = {}
+                    for _, ei in ipairs(s.elseifs or {}) do
+                        newEifs[#newEifs + 1] = {
+                            condition = rewriteExpr(ei.condition),
+                            body = rewriteIfBlock(ei.body, funcScope),
+                        }
+                    end
+                    local newElse = s.elsebody and rewriteIfBlock(s.elsebody, funcScope) or nil
+                    curStmts[#curStmts + 1] = Ast.IfStatement(newCond, newBody, newEifs, newElse)
                 end
                 if nb.term.kind == "branch" and nb.term.condPos == idxS then
                     liftedBranchCond = snapshotExprListAtNow({ rewriteExpr(nb.term.cond) })[1]
@@ -1696,6 +2832,22 @@ local function liftContainer(block, info, targetLuaVersion)
                         local rhs = s.rhs[1]
                         local isBlockLocal = blockLocalVarIds[vid]
 
+                        local function stmtWritesFuncVar(st, targetVid)
+                            if not st then return false end
+                            local hit = false
+                            visitSub(st, function(n)
+                                if n.kind == AstKind.FunctionLiteralExpression then return nil, true end
+                                if n.kind == AstKind.AssignmentVariable and n.scope == funcScope and n.id == targetVid then
+                                    hit = true
+                                elseif n.kind == AstKind.LocalVariableDeclaration and n.scope == funcScope then
+                                    for _, lid in ipairs(n.ids) do
+                                        if lid == targetVid then hit = true end
+                                    end
+                                end
+                            end, nil, info.globalScope)
+                            return hit
+                        end
+
                         if rhs.kind == AstKind.NilExpression then
                             local prevWriteIsNil = false
                             local hasEarlierWrite = false
@@ -1713,6 +2865,9 @@ local function liftContainer(block, info, targetLuaVersion)
                                         end
                                     end
                                     if wroteVid then break end
+                                elseif stmtWritesFuncVar(sk, vid) then
+                                    hasEarlierWrite = true
+                                    break
                                 end
                             end
                             local hasLaterRead = false
@@ -1752,6 +2907,7 @@ local function liftContainer(block, info, targetLuaVersion)
                             local readInCond = false
                             local readInRet = false
                             local killedIdx = nil
+                            local abortedByPartialWrite = false
 
                             local function countVarReads(node)
                                 local c = 0
@@ -1782,6 +2938,9 @@ local function liftContainer(block, info, targetLuaVersion)
                                     end
                                     killedIdx = j
                                     break
+                                elseif stmtWritesFuncVar(sj, vid) then
+                                    abortedByPartialWrite = true
+                                    break
                                 else
                                     local rc = countVarReads(sj)
                                     if rc > 0 then
@@ -1791,7 +2950,7 @@ local function liftContainer(block, info, targetLuaVersion)
                                 end
                             end
 
-                            if not killedIdx and isBlockLocal then
+                            if not killedIdx and not abortedByPartialWrite and isBlockLocal then
                                 if lb.term.kind == "branch" then
                                     local rc = countVarReads(lb.term.cond)
                                     if rc > 0 then
@@ -1810,7 +2969,7 @@ local function liftContainer(block, info, targetLuaVersion)
                                 end
                             end
 
-                            local canTransform = isBlockLocal or (killedIdx ~= nil)
+                            local canTransform = not abortedByPartialWrite and (isBlockLocal or (killedIdx ~= nil))
 
                             if canTransform and readCount == 0 then
                                 if rhs.kind == AstKind.FunctionCallExpression then
@@ -1842,6 +3001,9 @@ local function liftContainer(block, info, targetLuaVersion)
                                                 end
                                             end
                                             if wroteVid then break end
+                                        elseif stmtWritesFuncVar(sk, vid) then
+                                            hasPrevNonNilWrite = true
+                                            break
                                         end
                                     end
                                     if not hasPrevNonNilWrite then
@@ -1876,21 +3038,21 @@ local function liftContainer(block, info, targetLuaVersion)
                                 local canCommute = true
                                 for k = i + 1, targetPos - 1 do
                                     local sk = stmts[k]
-                                    if sk.kind == AstKind.AssignmentStatement then
-                                        for _, l in ipairs(sk.lhs) do
-                                            if l.kind == AstKind.AssignmentVariable and l.scope == funcScope and rhsDeps[l.id] then
-                                                canCommute = false
-                                            end
-                                        end
-                                    elseif sk.kind == AstKind.LocalVariableDeclaration and sk.scope == funcScope then
-                                        for _, id in ipairs(sk.ids) do
-                                            if rhsDeps[id] then canCommute = false end
+                                    for depId in pairs(rhsDeps) do
+                                        if stmtWritesFuncVar(sk, depId) then
+                                            canCommute = false
+                                            break
                                         end
                                     end
                                     if (not pure or isTbl) and stmtHasSideEffect(sk, info.globalScope) then
                                         canCommute = false
                                     end
                                     if rhsHasCall and (not isPureInlineExpr(sk.rhs and sk.rhs[1], funcScope)) then
+                                        canCommute = false
+                                    end
+                                end
+                                if canCommute and readStmtIdx and stmts[readStmtIdx].kind == AstKind.IfStatement then
+                                    if countVarReads(stmts[readStmtIdx].condition) ~= 1 then
                                         canCommute = false
                                     end
                                 end
@@ -2462,13 +3624,56 @@ local function liftContainer(block, info, targetLuaVersion)
     end
 
     if #topDecls > 0 then
-        liftedTop.scope:setParent(holderScope)
+        local outScope = liftedTop.scope
+        local holderToOut = {}
+        local function mapHolderId(hid)
+            if not holderToOut[hid] then
+                holderToOut[hid] = outScope:addVariable(holderScope:getVariableName(hid))
+            end
+            return holderToOut[hid]
+        end
         for i = 1, #liftedTop.statements do
             topDecls[#topDecls + 1] = liftedTop.statements[i]
         end
-        local wrapped = Ast.Block(topDecls, holderScope)
-        rebindScopesInSubtree(wrapped, holderScope, info.globalScope)
-        return wrapped
+        liftedTop.statements = topDecls
+        visitSub(liftedTop, function(n)
+            if n.kind == AstKind.LocalVariableDeclaration and n.scope == holderScope then
+                n.scope = outScope
+                for j = 1, #n.ids do n.ids[j] = mapHolderId(n.ids[j]) end
+            elseif (n.kind == AstKind.LocalFunctionDeclaration or n.kind == AstKind.FunctionDeclaration)
+                and n.scope == holderScope then
+                n.scope = outScope
+                n.id = mapHolderId(n.id)
+            elseif (n.kind == AstKind.VariableExpression or n.kind == AstKind.AssignmentVariable)
+                and n.scope == holderScope then
+                n.scope = outScope
+                n.id = mapHolderId(n.id)
+            end
+        end, nil, info.globalScope)
+        local function purgeHolder(sc)
+            if not sc then return end
+            if sc.variablesFromHigherScopes then
+                sc.variablesFromHigherScopes[holderScope] = nil
+            end
+            for _, ch in ipairs(sc.children or {}) do
+                purgeHolder(ch)
+            end
+        end
+        purgeHolder(holderScope)
+        purgeHolder(outScope)
+        outScope:setParent(topParentScope)
+        local hChildren = {}
+        for _, hc in ipairs(holderScope.children or {}) do
+            if hc ~= outScope then hChildren[#hChildren + 1] = hc end
+        end
+        for _, hc in ipairs(hChildren) do
+            hc:setParent(outScope)
+        end
+        if holderScope.parentScope then
+            holderScope.parentScope:removeChild(holderScope)
+        end
+        rebindScopesInSubtree(liftedTop, topParentScope, info.globalScope)
+        return liftedTop
     end
 
     liftedTop.scope:setParent(topParentScope)
@@ -2490,12 +3695,13 @@ function CffDecompiler.unflatten(ast, targetLuaVersion)
                         prefix[#prefix + 1] = node.body.statements[i]
                     end
                     if #prefix == 0 then
-                        lifted.scope:setParent(node.body.scope.parentScope or ast.globalScope)
+                        local oldFnScope = node.body.scope
                         for _, arg in ipairs(node.args) do
                             if arg.kind == AstKind.VariableExpression then
                                 local newId = lifted.scope:addVariable()
                                 visitSub(lifted, function(m)
-                                    if isVarRef(m, arg.scope, arg.id) then
+                                    if (m.kind == AstKind.VariableExpression or m.kind == AstKind.AssignmentVariable)
+                                        and m.scope == arg.scope and m.id == arg.id then
                                         m.scope = lifted.scope
                                         m.id = newId
                                     end
@@ -2503,6 +3709,18 @@ function CffDecompiler.unflatten(ast, targetLuaVersion)
                                 arg.scope = lifted.scope
                                 arg.id = newId
                             end
+                        end
+                        local function purgeFnSc(sc)
+                            if not sc then return end
+                            if sc.variablesFromHigherScopes then
+                                sc.variablesFromHigherScopes[oldFnScope] = nil
+                            end
+                            for _, ch in ipairs(sc.children or {}) do purgeFnSc(ch) end
+                        end
+                        purgeFnSc(lifted.scope)
+                        lifted.scope:setParent(oldFnScope.parentScope or ast.globalScope)
+                        if oldFnScope.parentScope then
+                            oldFnScope.parentScope:removeChild(oldFnScope)
                         end
                         node.body = lifted
                     else
@@ -2520,8 +3738,20 @@ function CffDecompiler.unflatten(ast, targetLuaVersion)
     if topInfo then
         local lifted = liftContainer(ast.body, topInfo, targetLuaVersion)
         if lifted then
-            if #ast.body.statements == 1 then
+            if #ast.body.statements == 1 or topInfo.pureOuterSetup then
+                local oldTopScope = ast.body.scope
+                local function purgeTopSc(sc)
+                    if not sc then return end
+                    if sc.variablesFromHigherScopes then
+                        sc.variablesFromHigherScopes[oldTopScope] = nil
+                    end
+                    for _, ch in ipairs(sc.children or {}) do purgeTopSc(ch) end
+                end
+                purgeTopSc(lifted.scope)
                 lifted.scope:setParent(ast.globalScope)
+                if oldTopScope and oldTopScope.parentScope then
+                    oldTopScope.parentScope:removeChild(oldTopScope)
+                end
                 ast.body = lifted
             else
                 lifted.scope:setParent(ast.body.scope)
@@ -2532,6 +3762,31 @@ function CffDecompiler.unflatten(ast, targetLuaVersion)
     end
 
     return changed
+end
+
+function CffDecompiler.detect(ast)
+    if ast.body and matchCffContainer(ast.body, ast.globalScope) then
+        return { present = true, ready = true, topLevel = true }
+    end
+    local nestedReady = false
+    local candidateEnvelope = false
+    visitast(ast, function(node)
+        if node.kind == AstKind.FunctionLiteralExpression and node.body then
+            if matchCffContainer(node.body, ast.globalScope) then
+                nestedReady = true
+            end
+        elseif node.kind == AstKind.FunctionCallExpression
+            and node.base.kind == AstKind.FunctionLiteralExpression
+            and #node.args == 11 and #node.base.args >= 23 then
+            candidateEnvelope = true
+        end
+    end)
+    if nestedReady then
+        return { present = true, ready = true, topLevel = false }
+    elseif candidateEnvelope then
+        return { present = true, ready = false, topLevel = false }
+    end
+    return nil
 end
 
 return CffDecompiler

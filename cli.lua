@@ -20,8 +20,10 @@ local function print_help()
     print("  --stdout               Write deobfuscated output to stdout")
     print("  --Lua51, --lua51       Force Lua 5.1 dialect")
     print("  --LuaU, --luau         Force Luau dialect")
-    print("  --passes               Print applied passes to stderr")
+    print("  --detect               Inspect detected Prometheus layers and exit")
+    print("  --passes               Print detected layers and applied passes to stderr")
     print("  --no-rename            Skip identifier normalization")
+    print("  -f, --force            Allow overwriting input file when -o matches input")
     print("  -v, --version          Print version")
     print("  -h, --help             Print this help message")
 end
@@ -85,8 +87,10 @@ local sourceFile = nil
 local outFile = nil
 local writeStdout = false
 local luaVersion = nil
+local detectOnly = false
 local showPasses = false
 local normalizeIds = true
+local forceOverwrite = false
 
 local i = 1
 if args[1] == "deobfuscate" then
@@ -114,10 +118,14 @@ while i <= #args do
         luaVersion = "Lua51"
     elseif curr == "--LuaU" or curr == "--luau" then
         luaVersion = "LuaU"
+    elseif curr == "--detect" then
+        detectOnly = true
     elseif curr == "--passes" or curr == "--report" then
         showPasses = true
     elseif curr == "--no-rename" then
         normalizeIds = false
+    elseif curr == "-f" or curr == "--force" then
+        forceOverwrite = true
     elseif curr:sub(1, 1) == "-" then
         fail("Unknown option: " .. curr)
     else
@@ -151,6 +159,21 @@ local deobfuscator = Prometheus.Deobfuscator:new({
     NormalizeIdentifiers = normalizeIds,
 })
 
+if detectOnly then
+    local okDet, detOrErr = pcall(function()
+        return deobfuscator:detect(source)
+    end)
+    if not okDet then
+        fail(detOrErr)
+    end
+    local layers = #detOrErr.layers > 0 and table.concat(detOrErr.layers, ", ") or "none"
+    print(string.format("Prometheus: %s", tostring(detOrErr.isPrometheus)))
+    print(string.format("Dialect: %s", tostring(detOrErr.luaVersion)))
+    print(string.format("Detected: %s", layers))
+    print(string.format("FirstPass: %s", tostring(detOrErr.recommendedFirstPass or "none")))
+    os.exit(0)
+end
+
 local ok, outputOrErr, report = pcall(function()
     return deobfuscator:deobfuscate(source)
 end)
@@ -159,8 +182,10 @@ if not ok then
 end
 
 if showPasses and report and report.appliedPasses then
-    local list = #report.appliedPasses > 0 and table.concat(report.appliedPasses, ", ") or "none"
-    io.stderr:write(string.format("Dialect: %s | Passes: %s\n", tostring(report.luaVersion), list))
+    local detLayers = (report.detected and report.detected.layers and #report.detected.layers > 0)
+        and table.concat(report.detected.layers, ", ") or "none"
+    local list = #report.appliedPasses > 0 and table.concat(report.appliedPasses, " -> ") or "none"
+    io.stderr:write(string.format("Dialect: %s | Initial: %s | Passes: %s\n", tostring(report.luaVersion), detLayers, list))
 end
 
 if writeStdout then
@@ -172,6 +197,9 @@ end
 
 if outFile or not writeStdout then
     local target = outFile or derive_output_path(sourceFile)
+    if target == sourceFile and not forceOverwrite then
+        fail("Refusing to overwrite input file without --force: " .. tostring(sourceFile))
+    end
     local wroteOk, writeErr = write_all_bytes(target, outputOrErr)
     if not wroteOk then
         fail(writeErr)
